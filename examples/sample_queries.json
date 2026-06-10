@@ -1,0 +1,29 @@
+[
+  {
+    "query": "Where is the authenticate_user function defined?",
+    "expected_type": "simple-lookup",
+    "expected_file": "auth.py",
+    "expected_function": "authenticate_user"
+  },
+  {
+    "query": "How does the login flow work end-to-end?",
+    "expected_type": "multi-hop",
+    "expected_files": ["app.py", "auth.py", "db.py"],
+    "expected_functions": ["handle_login", "authenticate_user", "create_token", "save_session"]
+  },
+  {
+    "query": "What functions does handle_login call?",
+    "expected_type": "simple-lookup",
+    "expected_callees": ["authenticate_user", "create_token", "save_session"]
+  },
+  {
+    "query": "What would break if I changed the User class?",
+    "expected_type": "multi-hop",
+    "expected_files": ["db.py", "auth.py", "app.py"]
+  },
+  {
+    "query": "Explain the authentication architecture of this project.",
+    "expected_type": "exploratory",
+    "expected_files": ["app.py", "auth.py", "db.py"]
+  }
+]

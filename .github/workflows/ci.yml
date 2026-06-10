@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [dev]
+  push:
+    branches: [dev]
+
+jobs:
+  ascii-guard:
+    name: ASCII Guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for non-ASCII characters
+        run: |
+          if grep -rPn '[^\x00-\x7F]' --include="*.py" --include="*.md" --include="*.sh" --include="*.yml" --include="*.yaml" --include="*.toml" --include="*.json" --include="*.jsx" --include="*.js" --include="*.ts" --include="*.tsx" .; then
+            echo "ERROR: Non-ASCII characters found. See above for locations."
+            exit 1
+          fi
+          echo "ASCII guard passed."
+
+  internal-data-guard:
+    name: Internal Data Guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for internal data leaks
+        run: |
+          TRACKED=$(git ls-files -- '_internal/*' ':!_internal/PROJECT_CONTEXT.md')
+          if [ -n "$TRACKED" ]; then
+            echo "ERROR: Files under _internal/ are tracked (only PROJECT_CONTEXT.md allowed):"
+            echo "$TRACKED"
+            exit 1
+          fi
+          echo "Internal data guard passed."
+
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install linters
+        run: pip install ruff black
+      - name: Ruff check
+        run: ruff check src/ tests/
+      - name: Black check
+        run: black --check src/ tests/
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-asyncio
+      - name: Run tests
+        run: pytest tests/unit/ -v --tb=short --timeout=60

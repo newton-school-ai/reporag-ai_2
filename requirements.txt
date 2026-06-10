@@ -1,0 +1,75 @@
+# RepoRAG AI - Python Dependencies
+# Install: pip install -r requirements.txt
+
+# --- Core API ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+python-dotenv==1.0.1
+python-multipart==0.0.20
+
+# --- Database ---
+sqlalchemy==2.0.36
+alembic==1.14.1
+aiosqlite==0.20.0
+asyncpg==0.30.0
+
+# --- Auth ---
+PyJWT==2.10.1
+httpx==0.28.1
+authlib==1.4.1
+
+# --- AST Parsing ---
+tree-sitter==0.24.0
+tree-sitter-python==0.23.6
+tree-sitter-javascript==0.23.1
+
+# --- Knowledge Graph ---
+neo4j==5.27.0
+networkx==3.4.2
+
+# --- Embeddings ---
+torch==2.5.1
+transformers==4.47.1
+sentence-transformers==3.3.1
+
+# --- Vector Store ---
+qdrant-client==1.12.1
+
+# --- BM25 ---
+rank-bm25==0.2.2
+
+# --- Reranker ---
+# (uses transformers + cross-encoder, no extra package)
+
+# --- Agent Framework ---
+langgraph==0.2.60
+langchain-core==0.3.29
+langchain-openai==0.2.14
+langchain-anthropic==0.3.3
+
+# --- LLM Clients ---
+openai==1.58.1
+anthropic==0.40.0
+
+# --- Evaluation ---
+ragas==0.2.10
+datasets==3.2.0
+
+# --- Dev / Testing ---
+pytest==8.3.4
+pytest-asyncio==0.24.0
+pytest-cov==6.0.0
+pytest-timeout==2.3.1
+
+# --- Linting ---
+ruff==0.8.4
+black==24.10.0
+pre-commit==4.0.1
+
+# --- Utilities ---
+tiktoken==0.8.0
+tqdm==4.67.1
+rich==13.9.4
+gitpython==3.1.43

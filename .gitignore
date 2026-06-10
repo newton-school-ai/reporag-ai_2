@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Internal NST data (gitignored except PROJECT_CONTEXT.md)
+_internal/*
+!_internal/PROJECT_CONTEXT.md
+
+# Data (local datasets)
+data/*
+!data/.gitkeep
+
+# Database
+*.db
+*.sqlite3
+
+# Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Docker
+*.log
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Alembic
+alembic/versions/__pycache__/
+
+# Model cache
+.cache/
+models/
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# Claude bootstrap template (local only, not for repo)
+CLAUDE.md
