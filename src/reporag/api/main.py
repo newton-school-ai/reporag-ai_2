@@ -17,7 +17,7 @@ from fastapi import FastAPI
 app = FastAPI(
     title="RepoRAG API",
     version="0.1.0",
-    description="Placeholder API app. Full implementation tracked in Issue 26."
+    description="Placeholder API app. Full implementation tracked in Issue 26.",
 )
 
 
