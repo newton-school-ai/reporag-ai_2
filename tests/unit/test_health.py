@@ -2,6 +2,7 @@
 
 # pyrefly: ignore [missing-import]
 from fastapi.testclient import TestClient
+
 from reporag.api.main import app
 
 client = TestClient(app)

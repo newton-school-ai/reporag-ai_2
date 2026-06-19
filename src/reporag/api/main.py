@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+
 from reporag.api.routes import health
 
 app = FastAPI(
