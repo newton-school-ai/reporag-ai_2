@@ -1,12 +1,18 @@
-"""FastAPI application entrypoint.
+from fastapi import FastAPI
+from reporag.api.routes import health
 
-Configures the FastAPI app with routes, middleware, CORS, and lifespan
-events. Run with: uvicorn src.reporag.api.main:app --reload
-"""
+app = FastAPI(
+    title="RepoRAG AI",
+    version="0.1.0",
+    description="Code-Aware Repository Intelligence - Agentic RAG for Codebases",
+)
 
-# TODO: Implement in Issue 26
-# - Create FastAPI app with metadata (title, version, description)
-# - Include routers: repos, query, health, auth
-# - Register middleware: CORS, auth, rate limiter, logging, error handler
-# - Lifespan events: connect to Neo4j + Qdrant on startup, close on shutdown
-# - OpenAPI docs at /docs
+# Register health router
+app.include_router(health.router, prefix="/api/v1")
+
+
+# Root level /health route for direct checks
+@app.get("/health")
+async def root_health():
+    """Root-level health check endpoint."""
+    return {"status": "healthy"}

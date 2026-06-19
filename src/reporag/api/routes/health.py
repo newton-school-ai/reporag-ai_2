@@ -1,7 +1,9 @@
-"""Health check endpoint.
+from fastapi import APIRouter
 
-GET /api/v1/health - Returns status of each pipeline component
-(Neo4j, Qdrant, LLM, database).
-"""
+router = APIRouter()
 
-# TODO: Implement in Issue 26
+
+@router.get("/health")
+async def health_check():
+    """Simple health check endpoint returning status of the service."""
+    return {"status": "healthy"}
