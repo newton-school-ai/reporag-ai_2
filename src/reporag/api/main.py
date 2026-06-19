@@ -21,6 +21,6 @@ app = FastAPI(
 )
 
 
-@app.get("/health")
-def health():
+def health() -> dict:
+    """Health check endpoint."""
     return {"status": "ok"}
