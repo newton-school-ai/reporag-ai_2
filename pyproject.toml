@@ -38,3 +38,9 @@ omit = ["tests/*", "alembic/*"]
 [tool.coverage.report]
 fail_under = 60
 show_missing = true
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
