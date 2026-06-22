@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check for internal data leaks
         run: |
-          TRACKED=$(git ls-files -- '_internal/*' ':!_internal/PROJECT_CONTEXT.md')
+          TRACKED=$(git ls-files -- '_internal/*' | grep -v '^_internal/PROJECT_CONTEXT.md$' || true)
           if [ -n "$TRACKED" ]; then
             echo "ERROR: Files under _internal/ are tracked (only PROJECT_CONTEXT.md allowed):"
             echo "$TRACKED"
