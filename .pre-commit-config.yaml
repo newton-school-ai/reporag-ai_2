@@ -1,52 +1,68 @@
+# Pre-commit hook configuration for RepoRAG AI
+# Install: pre-commit install
+# Run manually: pre-commit run --all-files
+#
+# Hook execution order:
+#   1. ascii-guard          -- block non-ASCII bytes before anything else
+#   2. internal-data-guard  -- block _internal/ leaks
+#   3. trailing-whitespace  -- standard hygiene
+#   4. end-of-file-fixer    -- ensure files end with a newline
+#   5. check-yaml           -- validate YAML syntax
+#   6. check-toml           -- validate TOML syntax
+#   7. check-json           -- validate JSON syntax
+#   8. check-merge-conflict -- reject unresolved conflict markers
+#   9. check-added-large-files -- reject accidental large file commits
+#  10. ruff                 -- lint + auto-fix Python
+#  11. black                -- enforce consistent Python formatting
+
 repos:
+  # --- Policy guards (run first, fail fast) ---
+  - repo: local
+    hooks:
+      - id: ascii-guard
+        name: ASCII-only check
+        description: >
+          Reject files containing non-ASCII characters.
+          Em dashes, smart quotes, non-breaking spaces, and similar
+          Unicode characters must not appear in source files.
+        entry: scripts/check_ascii.sh
+        language: script
+        types: [text]
+        pass_filenames: true
+
+      - id: internal-data-guard
+        name: Block _internal/ files (except PROJECT_CONTEXT.md)
+        description: >
+          Prevent accidental commits of files under _internal/.
+          Only _internal/PROJECT_CONTEXT.md is whitelisted.
+        entry: scripts/check_internal_data.sh
+        language: script
+        pass_filenames: true
+
+  # --- Standard file hygiene ---
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
       - id: check-added-large-files
         args: ["--maxkb=500"]
 
+  # --- Python linting: ruff ---
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.8.4
     hooks:
       - id: ruff
+        name: ruff lint
         args: ["--fix"]
 
+  # --- Python formatting: black ---
   - repo: https://github.com/psf/black
     rev: 24.10.0
     hooks:
       - id: black
-
-  - repo: local
-    hooks:
-      - id: ascii-only
-        name: ASCII-only check
-        entry: |
-          bash -c '
-          if grep -rPn "[^\x00-\x7F]" --include="*.py" --include="*.md" --include="*.sh" "$@" 2>/dev/null;
-          then
-            echo "Non-ASCII characters found"
-            exit 1
-          fi'
-        language: system
-        types: [text]
-        pass_filenames: true
-
-      - id: internal-data-guard
-        name: Block _internal/ files (except PROJECT_CONTEXT.md)
-        entry: |
-          bash -c '
-          for f in "$@"; do
-            case "$f" in
-              _internal/PROJECT_CONTEXT.md) ;;
-              _internal/*)
-                echo "BLOCKED: $f"
-                exit 1
-                ;;
-            esac
-          done'
-        language: system
-        types: [text]
-        pass_filenames: true
+        name: black format
