@@ -13,7 +13,7 @@ config = context.config
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./reporag.db")
 
-# IMPORTANT: convert asyncpg → psycopg2 for Alembic
+# IMPORTANT: convert asyncpg to psycopg2 for Alembic
 if DATABASE_URL.startswith("postgresql+asyncpg"):
     DATABASE_URL = DATABASE_URL.replace("+asyncpg", "")
 
