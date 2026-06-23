@@ -244,10 +244,8 @@ class TestRuffBlackCleanScaffold:
 
     def test_ruff_passes(self) -> None:
         """ruff check should pass on src/ and tests/ directories."""
-        import sys
-
         result = subprocess.run(
-            [sys.executable, "-m", "ruff", "check", "src", "tests", "alembic"],
+            ["ruff", "check", "src/", "tests/"],
             capture_output=True,
             text=True,
             cwd=str(REPO_ROOT),
@@ -256,10 +254,8 @@ class TestRuffBlackCleanScaffold:
 
     def test_black_passes(self) -> None:
         """black --check should pass on src/ and tests/ directories."""
-        import sys
-
         result = subprocess.run(
-            [sys.executable, "-m", "black", "--check", "src", "tests", "alembic"],
+            ["black", "--check", "src/", "tests/"],
             capture_output=True,
             text=True,
             cwd=str(REPO_ROOT),

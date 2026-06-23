@@ -3,14 +3,19 @@ from collections.abc import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-# Get DATABASE_URL from environment or use a default SQLite path
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./reporag.db")
 
-# Automatically use asyncpg if postgresql is provided
-if DATABASE_URL.startswith("postgresql://"):
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
-elif DATABASE_URL.startswith("sqlite://"):
-    DATABASE_URL = DATABASE_URL.replace("sqlite://", "sqlite+aiosqlite://", 1)
+def get_async_database_url(url: str) -> str:
+    """Format the database URL to use async drivers if necessary."""
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    elif url.startswith("sqlite://"):
+        return url.replace("sqlite://", "sqlite+aiosqlite://", 1)
+    return url
+
+
+# Get DATABASE_URL from environment or use a default SQLite path
+raw_url = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./reporag.db")
+DATABASE_URL = get_async_database_url(raw_url)
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 
