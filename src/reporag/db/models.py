@@ -42,14 +42,14 @@ class BaseTimestampModel(Base):
     )
 
 
-class JobStatus(str, enum.Enum):
+class JobStatus(enum.StrEnum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     FAILED = "failed"
 
 
-class RepositoryStatus(str, enum.Enum):
+class RepositoryStatus(enum.StrEnum):
     QUEUED = "queued"
     CLONING = "cloning"
     PROCESSING = "processing"
