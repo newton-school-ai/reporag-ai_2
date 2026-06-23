@@ -46,7 +46,7 @@ class TimestampMixin:
     )
 
 
-class RepositoryStatus(str, enum.Enum):
+class RepositoryStatus(enum.StrEnum):
     """Lifecycle state of an ingested repository."""
 
     QUEUED = "queued"
@@ -55,7 +55,7 @@ class RepositoryStatus(str, enum.Enum):
     ERROR = "error"
 
 
-class JobStatus(str, enum.Enum):
+class JobStatus(enum.StrEnum):
     """Lifecycle state of a single ingestion job."""
 
     PENDING = "pending"
