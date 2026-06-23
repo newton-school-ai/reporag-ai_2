@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     app_debug: bool = True
     app_port: int = 8000
     app_host: str = "0.0.0.0"
-    secret_key: SecretStr = SecretStr("change-me")
+    secret_key: SecretStr
 
     # Database
     database_url: str = "sqlite:///./reporag.db"
@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     # Neo4j
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
-    neo4j_password: SecretStr = SecretStr("reporag123")
+    neo4j_password: SecretStr
 
     # Qdrant
     qdrant_url: str = "http://localhost:6333"
@@ -39,7 +39,7 @@ class Settings(BaseSettings):
 
     # LLM
     llm_provider: str = "openai"
-    openai_api_key: SecretStr = SecretStr("")
+    openai_api_key: SecretStr
     openai_model: str = "gpt-4o"
     anthropic_api_key: SecretStr = SecretStr("")
     anthropic_model: str = "claude-sonnet-4-20250514"
@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     google_redirect_uri: str = "http://localhost:8000/auth/google/callback"
 
     # JWT
-    jwt_secret_key: SecretStr = SecretStr("change-me")
+    jwt_secret_key: SecretStr
     jwt_access_token_expire_minutes: int = 30
     jwt_refresh_token_expire_days: int = 7
 
