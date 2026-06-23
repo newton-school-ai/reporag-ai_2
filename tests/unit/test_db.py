@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from alembic import command
 from alembic.config import Config
-from src.reporag.db.models import (
+from reporag.db.models import (
     Base,
     IngestionJob,
     JobStatus,
@@ -17,7 +17,7 @@ from src.reporag.db.models import (
     RepositoryStatus,
     User,
 )
-from src.reporag.db.session import get_async_database_url, get_db
+from reporag.db.session import get_async_database_url, get_db
 
 
 @pytest.fixture(autouse=True)
