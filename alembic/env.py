@@ -7,8 +7,8 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
-from src.reporag.db.models import Base
-from src.reporag.db.session import get_async_database_url
+from reporag.db.models import Base
+from reporag.db.session import get_async_database_url
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
