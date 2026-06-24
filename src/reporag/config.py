@@ -1,82 +1,75 @@
-"""RepoRAG configuration module.
+from typing import Literal
 
-Loads settings from .env file using Pydantic Settings.
-All configuration is centralized here -- no scattered os.getenv calls.
-"""
-
-from pydantic import SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Application settings loaded from environment variables."""
+    # App Settings
+    app_env: Literal["development", "staging", "production"] = "development"
+    app_host: str = "0.0.0.0"
+    app_port: int = 8000
+
+    # Database Settings
+    database_url: str = "sqlite+aiosqlite:///reporag.db"
+
+    # Neo4j Settings
+    neo4j_uri: str = "bolt://localhost:7687"
+    neo4j_username: str = "neo4j"
+    neo4j_password: SecretStr = Field(default=SecretStr("password"))
+
+    # Qdrant Settings
+    qdrant_url: str = "http://localhost:6333"
+    qdrant_api_key: SecretStr | None = None
+
+    # LLM Settings
+    llm_provider: Literal["openai", "anthropic"] = "openai"
+    openai_api_key: SecretStr | None = None
+    anthropic_api_key: SecretStr | None = None
+
+    # Auth Settings
+    secret_key: SecretStr = Field(default=SecretStr("super-secret-key"))
+    jwt_secret_key: SecretStr = Field(default=SecretStr("super-jwt-key"))
+    google_client_secret: SecretStr | None = None
 
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        case_sensitive=False,
+        env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
 
-    # App
-    app_env: str = "development"
-    app_debug: bool = True
-    app_port: int = 8000
-    app_host: str = "0.0.0.0"
-    secret_key: SecretStr = SecretStr("change-me")
+    @model_validator(mode="after")
+    def validate_production_secrets(self) -> "Settings":
+        if self.app_env == "production":
+            errors = []
+            if not self.secret_key or self.secret_key.get_secret_value() in (
+                "super-secret-key",
+                "",
+                "change-me",
+            ):
+                errors.append("SECRET_KEY must be set to a secure value in production.")
+            if not self.jwt_secret_key or self.jwt_secret_key.get_secret_value() in (
+                "super-jwt-key",
+                "",
+                "change-me",
+            ):
+                errors.append(
+                    "JWT_SECRET_KEY must be set to a secure value in production."
+                )
 
-    # Database
-    database_url: str = "sqlite:///./reporag.db"
+            if self.llm_provider == "openai" and not self.openai_api_key:
+                errors.append(
+                    "OPENAI_API_KEY must be set in production when using OpenAI."
+                )
+            elif self.llm_provider == "anthropic" and not self.anthropic_api_key:
+                errors.append(
+                    "ANTHROPIC_API_KEY must be set in production when using Anthropic."
+                )
 
-    # Neo4j
-    neo4j_uri: str = "bolt://localhost:7687"
-    neo4j_user: str = "neo4j"
-    neo4j_password: SecretStr = SecretStr("reporag123")
-
-    # Qdrant
-    qdrant_url: str = "http://localhost:6333"
-    qdrant_collection_code: str = "reporag_code"
-    qdrant_collection_docs: str = "reporag_docs"
-
-    # LLM
-    llm_provider: str = "openai"
-    openai_api_key: SecretStr = SecretStr("")
-    openai_model: str = "gpt-4o"
-    anthropic_api_key: SecretStr = SecretStr("")
-    anthropic_model: str = "claude-sonnet-4-20250514"
-
-    # Embedding models
-    code_embedding_model: str = "microsoft/unixcoder-base"
-    doc_embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-
-    # Google OAuth
-    google_client_id: str = ""
-    google_client_secret: SecretStr = SecretStr("")
-    google_redirect_uri: str = "http://localhost:8000/auth/google/callback"
-
-    # JWT
-    jwt_secret_key: SecretStr = SecretStr("change-me")
-    jwt_access_token_expire_minutes: int = 30
-    jwt_refresh_token_expire_days: int = 7
-
-    # Rate limiting
-    rate_limit_per_minute: int = 60
-
-    # Retrieval
-    vector_search_top_k: int = 20
-    bm25_search_top_k: int = 20
-    rerank_top_k: int = 10
-    rrf_constant: int = 60
-
-    # Ingestion
-    max_repo_size_mb: int = 500
-    clone_depth: int = 1
-    supported_languages: str = "python,javascript,typescript"
-
-    # Feature flags
-    enable_graph_retrieval: bool = True
-    enable_reranker: bool = True
-    enable_agentic_planner: bool = True
+            if errors:
+                raise ValueError(
+                    "Production configuration missing required secrets:\n"
+                    + "\n".join(errors)
+                )
+        return self
 
 
 settings = Settings()
