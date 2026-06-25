@@ -134,6 +134,21 @@ class Settings(BaseSettings):
             return self.anthropic_api_key
         return self.openai_api_key
 
+    @property
+    def language_extensions(self) -> dict[str, str]:
+        """Extension to language mapping used by repository discovery."""
+        mapping = {
+            "python": ".py",
+            "javascript": ".js",
+            "typescript": ".ts",
+        }
+
+        return {
+            ext: lang
+            for lang, ext in mapping.items()
+            if lang in self.supported_languages_list
+        }
+
     # ----- Validation -----
 
     @model_validator(mode="after")
