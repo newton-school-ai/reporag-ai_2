@@ -13,8 +13,12 @@ source files, returning a manifest of (file_path, language, size_bytes).
 # - Clean up temp directory on error
 
 
+import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+from git import Repo
 
 
 @dataclass
@@ -73,7 +77,33 @@ class RepoCloner:
     ) -> str:
         """Clone a repository and return local path."""
 
-        raise NotImplementedError
+        temp_dir = tempfile.mkdtemp(prefix="reporag_")
+
+        try:
+            if Path(repo_source).exists():
+                shutil.copytree(
+                    repo_source,
+                    temp_dir,
+                    dirs_exist_ok=True,
+                )
+                return temp_dir
+
+            clone_args = {
+                "to_path": temp_dir,
+                "depth": depth,
+            }
+
+            if branch:
+                clone_args["branch"] = branch
+                clone_args["single_branch"] = True
+
+            Repo.clone_from(repo_source, **clone_args)
+
+            return temp_dir
+
+        except Exception:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
 
     def clone_and_discover(
         self,
