@@ -107,6 +107,13 @@ class Settings(BaseSettings):
     max_repo_size_mb: int = 500
     clone_depth: int = 1
     supported_languages: str = "python,javascript,typescript"
+    extension_map: dict[str, str] = {
+        ".py": "python",
+        ".js": "javascript",
+        ".ts": "typescript",
+        ".jsx": "javascript",
+        ".tsx": "typescript",
+    }
 
     # --- Feature flags ---
     enable_graph_retrieval: bool = True
