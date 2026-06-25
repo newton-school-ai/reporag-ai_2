@@ -11,3 +11,13 @@ source files, returning a manifest of (file_path, language, size_bytes).
 # - Walk file tree, filter by language extensions
 # - Return manifest: list of FileInfo(path, language, size)
 # - Clean up temp directory on error
+
+
+from dataclasses import dataclass
+
+
+@dataclass
+class FileInfo:
+    path: str
+    language: str
+    size_bytes: int
