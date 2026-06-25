@@ -113,4 +113,10 @@ class RepoCloner:
     ) -> list[FileInfo]:
         """Clone repository and discover source files."""
 
-        raise NotImplementedError
+        repo_path = self.clone_repository(
+            repo_source,
+            branch=branch,
+            depth=depth,
+        )
+
+        return self.discover_files(repo_path)
