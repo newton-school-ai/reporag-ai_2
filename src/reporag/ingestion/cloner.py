@@ -31,36 +31,56 @@ LANGUAGE_EXTENSIONS = {
 }
 
 
-def discover_files(repo_path: str) -> list[FileInfo]:
-    """Discover supported source files in a repository."""
+class RepoCloner:
+    """Clone repositories and discover source files."""
 
-    manifest: list[FileInfo] = []
+    def __init__(self) -> None:
+        self.extensions = {
+            ".py": "python",
+            ".js": "javascript",
+            ".ts": "typescript",
+        }
 
-    for file_path in Path(repo_path).rglob("*"):
-        if not file_path.is_file():
-            continue
+    def discover_files(self, repo_path: str) -> list[FileInfo]:
+        """Discover supported source files in a repository."""
 
-        language = LANGUAGE_EXTENSIONS.get(file_path.suffix)
+        manifest: list[FileInfo] = []
 
-        if language is None:
-            continue
+        for file_path in Path(repo_path).rglob("*"):
+            if not file_path.is_file():
+                continue
 
-        manifest.append(
-            FileInfo(
-                path=str(file_path),
-                language=language,
-                size_bytes=file_path.stat().st_size,
+            language = self.extensions.get(file_path.suffix)
+
+            if language is None:
+                continue
+
+            manifest.append(
+                FileInfo(
+                    path=str(file_path),
+                    language=language,
+                    size_bytes=file_path.stat().st_size,
+                )
             )
-        )
 
-    return manifest
+        return manifest
 
+    def clone_repository(
+        self,
+        repo_source: str,
+        branch: str | None = None,
+        depth: int = 1,
+    ) -> str:
+        """Clone a repository and return local path."""
 
-def clone_repository(
-    repo_source: str,
-    branch: str | None = None,
-    depth: int = 1,
-) -> str:
-    """Clone a repository and return local path."""
+        raise NotImplementedError
 
-    raise NotImplementedError
+    def clone_and_discover(
+        self,
+        repo_source: str,
+        branch: str | None = None,
+        depth: int = 1,
+    ) -> list[FileInfo]:
+        """Clone repository and discover source files."""
+
+        raise NotImplementedError
