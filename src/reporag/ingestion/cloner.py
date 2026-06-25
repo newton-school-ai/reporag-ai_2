@@ -54,3 +54,13 @@ def discover_files(repo_path: str) -> list[FileInfo]:
         )
 
     return manifest
+
+
+def clone_repository(
+    repo_source: str,
+    branch: str | None = None,
+    depth: int = 1,
+) -> str:
+    """Clone a repository and return local path."""
+
+    raise NotImplementedError
