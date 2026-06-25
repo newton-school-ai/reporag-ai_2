@@ -21,3 +21,10 @@ class FileInfo:
     path: str
     language: str
     size_bytes: int
+
+
+LANGUAGE_EXTENSIONS = {
+    ".py": "python",
+    ".js": "javascript",
+    ".ts": "typescript",
+}
