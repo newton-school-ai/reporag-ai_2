@@ -14,6 +14,7 @@ source files, returning a manifest of (file_path, language, size_bytes).
 
 
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass
@@ -28,3 +29,28 @@ LANGUAGE_EXTENSIONS = {
     ".js": "javascript",
     ".ts": "typescript",
 }
+
+
+def discover_files(repo_path: str) -> list[FileInfo]:
+    """Discover supported source files in a repository."""
+
+    manifest: list[FileInfo] = []
+
+    for file_path in Path(repo_path).rglob("*"):
+        if not file_path.is_file():
+            continue
+
+        language = LANGUAGE_EXTENSIONS.get(file_path.suffix)
+
+        if language is None:
+            continue
+
+        manifest.append(
+            FileInfo(
+                path=str(file_path),
+                language=language,
+                size_bytes=file_path.stat().st_size,
+            )
+        )
+
+    return manifest
