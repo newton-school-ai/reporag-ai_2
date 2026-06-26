@@ -1,15 +1,15 @@
 """Git repository cloner and file discovery service.
 
 Clones a Git repository to a temp directory and discovers all parseable
-source files, returning a manifest of FileInfo(file_path, language, size_bytes).
+source files, returning a manifest of FileEntry(path, language, size_bytes).
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import shutil
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +17,19 @@ from pathlib import Path
 from src.reporag.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Default language extension mappings from settings config
+SUPPORTED_EXTENSIONS = getattr(
+    settings,
+    "extension_map",
+    {
+        ".py": "python",
+        ".js": "javascript",
+        ".ts": "typescript",
+        ".jsx": "javascript",
+        ".tsx": "typescript",
+    },
+)
 
 
 class CloneError(Exception):
@@ -26,7 +39,7 @@ class CloneError(Exception):
 
 
 @dataclass(frozen=True)
-class FileInfo:
+class FileEntry:
     """Deterministic structural metadata for an ingested source file."""
 
     path: str
@@ -34,8 +47,12 @@ class FileInfo:
     size_bytes: int
 
 
+# Backwards-compatible alias for FileEntry
+FileInfo = FileEntry
+
+
 class RepoCloner:
-    """An asynchronous repository cloner and file discovery service.
+    """A repository cloner and file discovery service.
 
     Fully integrated with the application configuration settings.
     """
@@ -44,7 +61,7 @@ class RepoCloner:
         """Initialize the repository cloner."""
         self.max_repo_size_bytes = settings.max_repo_size_mb * 1024 * 1024
         self.default_depth = settings.clone_depth
-        self.extension_map = settings.extension_map
+        self.extension_map = SUPPORTED_EXTENSIONS
         self.last_clone_path: Path | None = None
         self.ignored_dirs: set[str] = {
             ".git",
@@ -59,27 +76,27 @@ class RepoCloner:
             ".eggs",
         }
 
-    async def clone_and_discover(
+    def clone_and_discover(
         self,
         repo_url: str,
         branch: str | None = None,
-        depth: int | None = None,
-    ) -> list[FileInfo]:
+        shallow: bool = True,
+        extensions: dict[str, str] | None = None,
+    ) -> list[FileEntry]:
         """Clones a repository, validates size constraints, and returns a manifest.
 
         Args:
             repo_url: Remote HTTPS URL or local repository path.
             branch: Optional branch name. If not provided, clones the default branch.
-            depth: Optional clone depth. Defaults to settings.clone_depth.
+            shallow: If True, uses shallow clone depth. Defaults to True.
+            extensions: Optional custom extension dictionary mappings.
 
         Returns:
-            A list of FileInfo objects representing discovered source files.
+            A list of FileEntry objects representing discovered source files.
 
         Raises:
             CloneError: If cloning or discovery fails.
         """
-        target_depth = depth if depth is not None else self.default_depth
-
         # Convert local path to file:// URI for depth to be honored consistently by Git
         if os.path.exists(repo_url):
             local_path = Path(repo_url).resolve()
@@ -93,8 +110,8 @@ class RepoCloner:
         self.last_clone_path = target_dir
 
         try:
-            await self._execute_async_clone(repo_url, target_dir, branch, target_depth)
-            manifest = self._discover_files(target_dir)
+            self._execute_clone(repo_url, target_dir, branch, shallow)
+            manifest = self._discover_files(target_dir, extensions)
             return manifest
         except Exception as e:
             logger.error(f"Ingestion pipeline failed for repository {repo_url}: {e}")
@@ -103,51 +120,59 @@ class RepoCloner:
                 raise CloneError(f"Internal ingestion failure: {e}") from e
             raise
 
-    async def _execute_async_clone(
+    def _execute_clone(
         self,
         repo_url: str,
         target_dir: Path,
         branch: str | None,
-        depth: int,
+        shallow: bool,
     ) -> None:
-        """Executes the git clone subprocess command asynchronously."""
+        """Executes the git clone subprocess command synchronously."""
         cmd = ["git", "clone"]
-        if depth > 0:
-            cmd.extend(["--depth", str(depth)])
+        if shallow:
+            # Respect configured default depth if available, otherwise default to 1
+            depth_val = self.default_depth if self.default_depth > 0 else 1
+            cmd.extend(["--depth", str(depth_val)])
         if branch:
             cmd.extend(["--branch", branch])
         cmd.extend([repo_url, str(target_dir)])
 
         try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            process = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
             )
-            stdout, stderr = await process.communicate()
         except Exception as e:
             raise CloneError(f"Failed to initiate git subprocess: {e}") from e
 
         if process.returncode != 0:
-            error_msg = stderr.decode().strip() if stderr else "Unknown git clone error"
+            error_msg = (
+                process.stderr.strip() if process.stderr else "Unknown git clone error"
+            )
             raise CloneError(
                 f"Git clone failed with code {process.returncode}: {error_msg}"
             )
 
-    def _discover_files(self, base_path: Path) -> list[FileInfo]:
+    def _discover_files(
+        self,
+        base_path: Path,
+        extensions: dict[str, str] | None = None,
+    ) -> list[FileEntry]:
         """Discovers files in the cloned directory and filters by extension.
 
         Args:
             base_path: Path to the cloned repository root.
+            extensions: Optional custom extension mappings.
 
         Returns:
-            A sorted list of FileInfo objects.
+            A sorted list of FileEntry objects.
         """
-        manifest: list[FileInfo] = []
+        manifest: list[FileEntry] = []
         total_size = 0
 
-        # Reload extension_map dynamically from settings if needed
-        ext_map = self.extension_map or settings.extension_map
+        # Resolve extension map prioritizing dynamic parameter, then instance map, then global
+        ext_map = extensions or self.extension_map or settings.extension_map
 
         for root, dirs, files in os.walk(base_path):
             # Prune ignored directories and hidden directories in-place
@@ -172,7 +197,7 @@ class RepoCloner:
 
                         rel_path = file_path.relative_to(base_path).as_posix()
                         manifest.append(
-                            FileInfo(
+                            FileEntry(
                                 path=rel_path,
                                 language=ext_map[ext],
                                 size_bytes=size,
