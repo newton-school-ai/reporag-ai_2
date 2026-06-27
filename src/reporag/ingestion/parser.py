@@ -15,9 +15,16 @@ to JS/TS). Handles parse errors gracefully with partial ASTs.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import tree_sitter_python as tspython
 from tree_sitter import Language, Parser, Tree
+
+from src.reporag.config import settings
+
+
+class UnsupportedLanguageError(Exception):
+    """Raised when no parser is registered for a language."""
 
 
 @dataclass
@@ -40,7 +47,7 @@ class ParseResult:
 
 
 class ASTParser:
-    def __init__(self):
+    def __init__(self) -> None:
         self._parsers: dict[str, Parser] = {}
         self._register("python", tspython.language())
 
@@ -107,3 +114,26 @@ class ASTParser:
             nodes.extend(self._extract_nodes(child, source_code))
 
         return nodes
+
+    def parse_file(
+        self,
+        file_path: str | Path,
+        language: str | None = None,
+    ) -> ParseResult:
+        """Parse a source file into a tree-sitter AST."""
+
+        path = Path(file_path)
+
+        source_code = path.read_text(encoding="utf-8")
+
+        if language is None:
+            extension = path.suffix.lower()
+
+        try:
+            language = settings.extension_map[extension]
+        except KeyError as exc:
+            raise UnsupportedLanguageError(
+                f"Unsupported file extension: {extension}"
+            ) from exc
+
+        return self.parse(source_code, language)
