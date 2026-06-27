@@ -74,3 +74,4 @@ tiktoken==0.8.0
 tqdm==4.67.1
 rich==13.9.4
 gitpython==3.1.43
+tree-sitter-javascript

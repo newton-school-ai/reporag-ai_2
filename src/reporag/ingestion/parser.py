@@ -6,12 +6,10 @@ to JS/TS). Handles parse errors gracefully with partial ASTs.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
-import tree_sitter_python as tspython
 from tree_sitter import Language, Node, Parser, Tree
 
 from src.reporag.config import settings
@@ -35,34 +33,62 @@ class NodeData:
     end_line: int
     start_col: int
     end_col: int
+    is_named: bool
+    is_error: bool
+
+
+def _load_python_grammar() -> object:
+    import tree_sitter_python as ts_python
+
+    return ts_python.language()
+
+
+def _load_javascript_grammar() -> object:
+    import tree_sitter_javascript as ts_javascript
+
+    return ts_javascript.language()
+
+
+_GRAMMAR_LOADERS: dict[str, Callable[[], object]] = {
+    "python": _load_python_grammar,
+    "javascript": _load_javascript_grammar,
+}
 
 
 class ASTParser:
+
     def __init__(self) -> None:
         self._parsers: dict[str, Parser] = {}
-        self._register("python", tspython.language())
 
-    def _register(
-        self,
-        language: str,
-        language_obj: Any,
-    ) -> None:
-        """Register a tree-sitter parser for a language."""
+    def _get_parser(self, language: str) -> Parser:
+        lang = language.lower().strip()
+        if lang in self._parsers:
+            return self._parsers[lang]
+
+        loader = _GRAMMAR_LOADERS.get(lang)
+        if loader is None:
+            raise UnsupportedLanguageError(
+                f"No parser registered for language: {language}"
+            )
+
+        try:
+            ts_language = Language(loader())
+        except ImportError as e:
+            raise UnsupportedLanguageError(
+                f"Grammar for {language!r} is not installed: {e}"
+            ) from e
+
         parser = Parser()
-        parser.language = Language(language_obj)
-        self._parsers[language] = parser
+        parser.language = ts_language
+        self._parsers[lang] = parser
+        return parser
 
     def parse(
         self,
         source_code: str | bytes,
         language: str = "python",
     ) -> Tree:
-        if language not in self._parsers:
-            raise UnsupportedLanguageError(
-                f"No parser registered for language: {language}"
-            )
-
-        parser = self._parsers[language]
+        parser = self._get_parser(language)
 
         source_bytes = (
             source_code.encode("utf-8") if isinstance(source_code, str) else source_code
@@ -99,6 +125,8 @@ class ASTParser:
             end_line=node.end_point[0] + 1,
             start_col=node.start_point[1],
             end_col=node.end_point[1],
+            is_named=node.is_named,
+            is_error=node.is_error or node.is_missing,
         )
 
     @staticmethod
