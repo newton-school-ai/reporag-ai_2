@@ -4,21 +4,14 @@ Parses source files into tree-sitter ASTs. Supports Python (extensible
 to JS/TS). Handles parse errors gracefully with partial ASTs.
 """
 
-# TODO: Implement in Issue 6
-# - Load tree-sitter grammar for target language
-# - Parse source string -> tree-sitter Tree
-# - Walk tree, return structured node data (type, text, start/end lines)
-# - Handle syntax errors (return partial AST, flag errors)
-# - Language-agnostic interface: Parser.parse(source, language)
-
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import tree_sitter_python as tspython
-from tree_sitter import Language, Parser, Tree
+from tree_sitter import Language, Node, Parser, Tree
 
 from src.reporag.config import settings
 
@@ -51,7 +44,11 @@ class ASTParser:
         self._parsers: dict[str, Parser] = {}
         self._register("python", tspython.language())
 
-    def _register(self, language: str, language_obj) -> None:
+    def _register(
+        self,
+        language: str,
+        language_obj: Any,
+    ) -> None:
         """Register a tree-sitter parser for a language."""
         parser = Parser()
         parser.language = Language(language_obj)
@@ -65,7 +62,9 @@ class ASTParser:
         """Parse source code into a tree-sitter AST."""
 
         if language not in self._parsers:
-            raise ValueError(f"No parser registered for language: {language}")
+            raise UnsupportedLanguageError(
+                f"No parser registered for language: {language}"
+            )
 
         parser = self._parsers[language]
 
@@ -85,7 +84,7 @@ class ASTParser:
             nodes=nodes,
         )
 
-    def _count_errors(self, node) -> int:
+    def _count_errors(self, node: Node) -> int:
         """Recursively count ERROR nodes in the AST."""
 
         count = 1 if node.type == "ERROR" else 0
@@ -95,7 +94,11 @@ class ASTParser:
 
         return count
 
-    def _extract_nodes(self, node, source_code: str) -> list[NodeData]:
+    def _extract_nodes(
+        self,
+        node: Node,
+        source_code: str,
+    ) -> list[NodeData]:
         """Recursively extract structured node data from the AST."""
 
         nodes = []
@@ -129,11 +132,11 @@ class ASTParser:
         if language is None:
             extension = path.suffix.lower()
 
-        try:
-            language = settings.extension_map[extension]
-        except KeyError as exc:
-            raise UnsupportedLanguageError(
-                f"Unsupported file extension: {extension}"
-            ) from exc
+            try:
+                language = settings.extension_map[extension]
+            except KeyError as exc:
+                raise UnsupportedLanguageError(
+                    f"Unsupported file extension: {extension}"
+                ) from exc
 
         return self.parse(source_code, language)
