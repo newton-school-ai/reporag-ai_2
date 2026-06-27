@@ -21,6 +21,10 @@ class UnsupportedLanguageError(Exception):
     """Raised when no parser is registered for a language."""
 
 
+class ParseError(Exception):
+    """Raised when a source file cannot be parsed at all."""
+
+
 @dataclass
 class NodeData:
     """Structured information extracted from an AST node."""
