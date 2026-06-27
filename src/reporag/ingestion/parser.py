@@ -6,6 +6,7 @@ to JS/TS). Handles parse errors gracefully with partial ASTs.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,15 +29,8 @@ class NodeData:
     text: str
     start_line: int
     end_line: int
-
-
-@dataclass
-class ParseResult:
-    tree: Tree
-    language: str
-    has_errors: bool
-    error_count: int
-    nodes: list[NodeData]
+    start_col: int
+    end_col: int
 
 
 class ASTParser:
@@ -56,11 +50,9 @@ class ASTParser:
 
     def parse(
         self,
-        source_code: str,
+        source_code: str | bytes,
         language: str = "python",
-    ) -> ParseResult:
-        """Parse source code into a tree-sitter AST."""
-
+    ) -> Tree:
         if language not in self._parsers:
             raise UnsupportedLanguageError(
                 f"No parser registered for language: {language}"
@@ -68,75 +60,62 @@ class ASTParser:
 
         parser = self._parsers[language]
 
-        tree = parser.parse(source_code.encode("utf-8"))
-        errors = self._count_errors(tree.root_node)
-
-        nodes = self._extract_nodes(
-            tree.root_node,
-            source_code,
+        source_bytes = (
+            source_code.encode("utf-8") if isinstance(source_code, str) else source_code
         )
 
-        return ParseResult(
-            tree=tree,
-            language=language,
-            has_errors=errors > 0,
-            error_count=errors,
-            nodes=nodes,
+        return parser.parse(source_bytes)
+
+    def walk(self, tree: Tree, named_only: bool = False) -> Iterator[NodeData]:
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
+            if not named_only or node.is_named:
+                yield self._to_node_data(node)
+            stack.extend(reversed(node.children))
+
+    def has_errors(self, tree: Tree) -> bool:
+        return tree.root_node.has_error
+
+    def find_errors(self, tree: Tree) -> list[NodeData]:
+        return [
+            self._to_node_data(n)
+            for n in self._iter_native(tree.root_node)
+            if n.is_error or n.is_missing
+        ]
+
+    @staticmethod
+    def _to_node_data(node: Node) -> NodeData:
+        """Convert a native tree-sitter Node into structured NodeData."""
+        raw = node.text if node.text is not None else b""
+        return NodeData(
+            type=node.type,
+            text=raw.decode("utf-8", errors="replace"),
+            start_line=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
+            start_col=node.start_point[1],
+            end_col=node.end_point[1],
         )
 
-    def _count_errors(self, node: Node) -> int:
-        """Recursively count ERROR nodes in the AST."""
+    @staticmethod
+    def _iter_native(node: Node) -> Iterator[Node]:
+        """Iteratively yield node and its descendants in pre-order.
 
-        count = 1 if node.type == "ERROR" else 0
+        Uses an explicit stack rather than recursion so deeply nested
+        trees cannot hit Python's recursion limit.
+        """
+        stack: list[Node] = [node]
+        while stack:
+            current = stack.pop()
+            yield current
+            stack.extend(reversed(current.children))
 
-        for child in node.children:
-            count += self._count_errors(child)
-
-        return count
-
-    def _extract_nodes(
-        self,
-        node: Node,
-        source_code: str,
-    ) -> list[NodeData]:
-        """Recursively extract structured node data from the AST."""
-
-        nodes = []
-
-        if node.is_named:
-            nodes.append(
-                NodeData(
-                    type=node.type,
-                    text=source_code[node.start_byte : node.end_byte],
-                    start_line=node.start_point[0],
-                    end_line=node.end_point[0],
-                )
-            )
-
-        for child in node.children:
-            nodes.extend(self._extract_nodes(child, source_code))
-
-        return nodes
-
-    def parse_file(
-        self,
-        file_path: str | Path,
-        language: str | None = None,
-    ) -> ParseResult:
-        """Parse a source file into a tree-sitter AST."""
-
+    def parse_file(self, file_path: str | Path, language: str | None = None) -> Tree:
         path = Path(file_path)
-
-        source_code = path.read_text(encoding="utf-8")
-
         if language is None:
-            extension = path.suffix.lower()
-
-            try:
-                language = settings.extension_map[extension]
-            except KeyError as exc:
+            language = settings.extension_map.get(path.suffix.lower())
+            if language is None:
                 raise UnsupportedLanguageError(
-                    f"Unsupported file extension: {extension}"
-                ) from exc
-
-        return self.parse(source_code, language)
+                    f"Cannot infer language for {path.name!r}"
+                )
+        return self.parse(path.read_text(encoding="utf-8"), language)
