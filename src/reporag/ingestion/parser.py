@@ -52,10 +52,20 @@ class ASTParser:
         parser = self._parsers[language]
 
         tree = parser.parse(source_code.encode("utf-8"))
-
+        errors = self._count_errors(tree.root_node)
         return ParseResult(
             tree=tree,
             language=language,
-            has_errors=False,
-            error_count=0,
+            has_errors=errors > 0,
+            error_count=errors,
         )
+
+    def _count_errors(self, node) -> int:
+        """Recursively count ERROR nodes in the AST."""
+
+        count = 1 if node.type == "ERROR" else 0
+
+        for child in node.children:
+            count += self._count_errors(child)
+
+        return count
