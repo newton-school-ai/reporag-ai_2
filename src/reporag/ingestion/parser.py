@@ -64,12 +64,18 @@ class ASTParser:
 
         tree = parser.parse(source_code.encode("utf-8"))
         errors = self._count_errors(tree.root_node)
+
+        nodes = self._extract_nodes(
+            tree.root_node,
+            source_code,
+        )
+
         return ParseResult(
             tree=tree,
             language=language,
             has_errors=errors > 0,
             error_count=errors,
-            nodes=[],
+            nodes=nodes,
         )
 
     def _count_errors(self, node) -> int:
@@ -81,3 +87,23 @@ class ASTParser:
             count += self._count_errors(child)
 
         return count
+
+    def _extract_nodes(self, node, source_code: str) -> list[NodeData]:
+        """Recursively extract structured node data from the AST."""
+
+        nodes = []
+
+        if node.is_named:
+            nodes.append(
+                NodeData(
+                    type=node.type,
+                    text=source_code[node.start_byte : node.end_byte],
+                    start_line=node.start_point[0],
+                    end_line=node.end_point[0],
+                )
+            )
+
+        for child in node.children:
+            nodes.extend(self._extract_nodes(child, source_code))
+
+        return nodes
