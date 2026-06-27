@@ -12,7 +12,13 @@ from __future__ import annotations
 
 import pytest
 
-from reporag.ingestion.parser import ASTParser, NodeInfo, ParserError, ParseResult
+from reporag.ingestion.parser import (
+    EXTENSION_TO_LANGUAGE,
+    ASTParser,
+    NodeInfo,
+    ParserError,
+    ParseResult,
+)
 
 # ---------------------------------------------------------------------------
 # Source fixtures (module-level constants keep tests readable)
@@ -623,3 +629,104 @@ def test_parser_is_reusable_across_calls():
 
     # Results must be independent of each other
     assert r1.source != r2.source
+
+
+# ---------------------------------------------------------------------------
+# 28. test_node_count_is_precomputed_and_stable
+# ---------------------------------------------------------------------------
+
+
+def test_node_count_is_precomputed_and_stable():
+    """node_count is an int field set once at parse time; repeated reads are O(1)."""
+    parser = ASTParser()
+    result = parser.parse(CLASS_WITH_METHODS, language="python")
+
+    # Must be a positive integer
+    assert isinstance(result.node_count, int)
+    assert result.node_count > 0
+
+    # Repeated access returns the same value (no re-traversal)
+    first = result.node_count
+    second = result.node_count
+    assert first == second
+
+    # Empty file still has at least the root 'module' node
+    empty = parser.parse("", language="python")
+    assert empty.node_count >= 1
+
+
+# ---------------------------------------------------------------------------
+# 29. test_parse_file_auto_detects_language
+# ---------------------------------------------------------------------------
+
+
+def test_parse_file_auto_detects_python(tmp_path):
+    """parse_file() with no language= infers 'python' from .py extension."""
+    src = tmp_path / "module.py"
+    src.write_text(SIMPLE_FUNCTION, encoding="utf-8")
+
+    parser = ASTParser()
+    result = parser.parse_file(str(src))  # no language= kwarg
+
+    assert result.language == "python"
+    assert result.has_error is False
+    assert result.root_node.type == "module"
+
+
+def test_parse_file_auto_detects_javascript(tmp_path):
+    """parse_file() with no language= infers 'javascript' from .js extension."""
+    src = tmp_path / "app.js"
+    src.write_text(JAVASCRIPT_FUNCTION, encoding="utf-8")
+
+    parser = ASTParser()
+    result = parser.parse_file(str(src))  # no language= kwarg
+
+    assert result.language == "javascript"
+    assert result.has_error is False
+    assert result.root_node.type == "program"
+
+
+def test_parse_file_unknown_extension_raises(tmp_path):
+    """parse_file() with unrecognised extension and no language= raises ParserError."""
+    src = tmp_path / "config.toml"
+    src.write_text("key = 'value'\n", encoding="utf-8")
+
+    parser = ASTParser()
+    with pytest.raises(ParserError, match=".toml"):
+        parser.parse_file(str(src))  # no language= and .toml not in map
+
+
+# ---------------------------------------------------------------------------
+# 30. test_extension_to_language_map
+# ---------------------------------------------------------------------------
+
+
+def test_extension_to_language_map():
+    """EXTENSION_TO_LANGUAGE covers the core extensions and maps to correct names."""
+    assert EXTENSION_TO_LANGUAGE[".py"] == "python"
+    assert EXTENSION_TO_LANGUAGE[".js"] == "javascript"
+    # All values must be non-empty strings
+    for ext, lang in EXTENSION_TO_LANGUAGE.items():
+        assert ext.startswith("."), f"Extension '{ext}' must start with '.'"
+        assert (
+            isinstance(lang, str) and lang
+        ), f"Language for '{ext}' must be a non-empty string"
+
+
+# ---------------------------------------------------------------------------
+# 31. test_parse_result_repr
+# ---------------------------------------------------------------------------
+
+
+def test_parse_result_repr():
+    """ParseResult.__repr__ is human-readable and includes key fields."""
+    parser = ASTParser()
+    result = parser.parse(SIMPLE_FUNCTION, language="python")
+
+    r = repr(result)
+    assert "ParseResult" in r
+    assert "python" in r
+    assert "has_error=False" in r
+    assert "node_count=" in r
+    # source bytes should be truncated, not dumped in full
+    assert "def hello" in r  # preview of first 40 chars

@@ -16,7 +16,7 @@ Usage::
     result = parser.parse('def hello():\\n    return 42\\n', language='python')
     print(result.root_node.type)    # 'module'
     print(result.has_error)         # False
-    print(result.node_count)        # total nodes in the tree
+    print(result.node_count)        # total nodes (computed once at parse time)
 
     # Walk every node depth-first
     for node_info in parser.walk(result):
@@ -25,25 +25,47 @@ Usage::
     # Walk only named (non-anonymous) nodes
     for node_info in parser.walk(result, named_only=True):
         print(node_info)
+
+    # Auto-detect language from file extension
+    result = parser.parse_file('src/main.py')      # language inferred as 'python'
+    result = parser.parse_file('app.js')            # language inferred as 'javascript'
+    result = parser.parse_file('mod.go', language='go')  # explicit override
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from collections import deque
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from tree_sitter import Language, Node, Parser, Tree
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Extension -> language map
+# ---------------------------------------------------------------------------
+
+#: Maps file extensions (lowercase, dot-prefixed) to canonical language names.
+#: Used by :meth:`ASTParser.parse_file` when ``language`` is not specified.
+#: Keep in sync with the extensions recognised by the ingestion cloner.
+EXTENSION_TO_LANGUAGE: dict[str, str] = {
+    ".py": "python",
+    ".js": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    ".ts": "typescript",
+    ".tsx": "tsx",
+}
+
+# ---------------------------------------------------------------------------
 # Supported language registry
 # ---------------------------------------------------------------------------
 
 #: Module-level registry: canonical language name -> tree_sitter Language.
-#: Populated lazily on first ASTParser instantiation so import time is fast.
+#: Populated lazily on the first ASTParser instantiation so import is fast.
 _LANGUAGE_REGISTRY: dict[str, Language] = {}
 
 
@@ -140,25 +162,49 @@ class NodeInfo:
         )
 
 
+def _count_nodes(root: Node) -> int:
+    """Return the total node count of the subtree rooted at *root* (BFS)."""
+    count = 0
+    queue: deque[Node] = deque([root])
+    while queue:
+        node = queue.popleft()
+        count += 1
+        queue.extend(node.children)
+    return count
+
+
 @dataclass
 class ParseResult:
     """The output of a single :meth:`ASTParser.parse` call.
 
+    ``node_count`` is computed **once** at construction time (inside
+    ``__post_init__``) and stored as a plain integer field, so accessing it
+    repeatedly is O(1) with zero re-traversal.
+
     Attributes:
-        tree:      Raw tree-sitter :class:`Tree`.  Access ``root_node`` for the
-                   AST root, or pass the whole result to :meth:`ASTParser.walk`.
-        language:  Canonical language name used for parsing (e.g. ``"python"``).
-        has_error: ``True`` when the source contained syntax errors.  The
-                   ``tree`` is still valid (partial AST produced by tree-sitter's
-                   error-recovery); callers decide whether to proceed or discard.
-        source:    Original source as ``bytes`` (UTF-8).  Stored so callers can
-                   slice out node text by byte offset if needed.
+        tree:       Raw tree-sitter :class:`Tree`.  Access ``root_node`` for
+                    the AST root, or pass the whole result to
+                    :meth:`ASTParser.walk`.
+        language:   Canonical language name used for parsing (e.g. ``"python"``).
+        has_error:  ``True`` when the source contained syntax errors.  The
+                    ``tree`` is still valid (partial AST produced by
+                    tree-sitter's error-recovery); callers decide whether to
+                    proceed or discard.
+        source:     Original source as ``bytes`` (UTF-8).  Stored so callers
+                    can slice out node text by byte offset if needed.
+        node_count: Total number of AST nodes (named + anonymous), computed
+                    once at parse time.
     """
 
     tree: Tree
     language: str
     has_error: bool
     source: bytes
+    # Computed once in __post_init__; not an __init__ parameter.
+    node_count: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.node_count = _count_nodes(self.tree.root_node)
 
     # ------------------------------------------------------------------
     # Convenience properties
@@ -169,20 +215,24 @@ class ParseResult:
         """Shortcut for ``tree.root_node``."""
         return self.tree.root_node
 
-    @property
-    def node_count(self) -> int:
-        """Total number of nodes in the AST (named + anonymous).
+    # ------------------------------------------------------------------
+    # Representation
+    # ------------------------------------------------------------------
 
-        Computed by a single BFS pass; cached implicitly via Python's property
-        semantics on the frozen :class:`Tree` object.
-        """
-        count = 0
-        queue: deque[Node] = deque([self.tree.root_node])
-        while queue:
-            node = queue.popleft()
-            count += 1
-            queue.extend(node.children)
-        return count
+    def __repr__(self) -> str:
+        src_preview = (
+            self.source[:40].decode("utf-8", errors="replace").replace("\n", "\\n")
+        )
+        if len(self.source) > 40:
+            src_preview += "..."
+        return (
+            f"ParseResult("
+            f"language={self.language!r}, "
+            f"has_error={self.has_error}, "
+            f"node_count={self.node_count}, "
+            f"source={src_preview!r}"
+            f")"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +280,7 @@ class ASTParser:
 
     def __init__(self, languages: dict[str, Language] | None = None) -> None:
         # Ensure the module-level registry is populated the first time any
-        # ASTParser is constructed (lazy so import of this module is fast).
+        # ASTParser is constructed (lazy, so importing this module is fast).
         if languages is None and not _LANGUAGE_REGISTRY:
             _load_builtin_languages()
 
@@ -281,8 +331,8 @@ class ASTParser:
 
         Returns:
             A :class:`ParseResult` containing the tree-sitter ``Tree``, the
-            ``language`` name, a ``has_error`` flag, and the original source
-            ``bytes``.
+            ``language`` name, a ``has_error`` flag, the original source
+            ``bytes``, and a pre-computed ``node_count``.
 
         Raises:
             ParserError: If *language* is not registered on this instance.
@@ -317,26 +367,37 @@ class ASTParser:
             source=source_bytes,
         )
 
-    def parse_file(self, file_path: str, *, language: str) -> ParseResult:
+    def parse_file(
+        self,
+        file_path: str,
+        *,
+        language: str | None = None,
+    ) -> ParseResult:
         """Read *file_path* from disk and parse it.
 
-        Convenience wrapper around :meth:`parse` for the common case where the
-        caller has a path rather than an in-memory string.
+        When *language* is omitted the language is **auto-detected** from the
+        file extension using :data:`EXTENSION_TO_LANGUAGE`.  Pass *language*
+        explicitly to override the auto-detection or to handle extensions not
+        in the built-in map.
 
         Args:
             file_path: Path to the source file (absolute or relative).
-            language:  Canonical language name (e.g. ``"python"``).
+            language:  Canonical language name (e.g. ``"python"``).  If
+                       ``None``, inferred from the file extension.
 
         Returns:
             A :class:`ParseResult`.
 
         Raises:
-            ParserError: If *language* is not registered.
+            ParserError: If *language* is not registered, or if *language* is
+                         ``None`` and the extension is not in
+                         :data:`EXTENSION_TO_LANGUAGE`.
             OSError:     If *file_path* cannot be opened or read.
         """
+        resolved_language = language or self._detect_language(file_path)
         with open(file_path, "rb") as fh:
             source_bytes = fh.read()
-        return self.parse(source_bytes, language=language)
+        return self.parse(source_bytes, language=resolved_language)
 
     def walk(
         self,
@@ -354,23 +415,23 @@ class ASTParser:
             result:     A :class:`ParseResult` returned by :meth:`parse` or
                         :meth:`parse_file`.
             named_only: When ``True``, anonymous nodes (punctuation, keywords
-                        stored as literals in the grammar) are skipped.  Only
-                        named grammar rules are yielded.
+                        stored as literals in the grammar) are skipped and only
+                        named grammar rules are yielded.  Anonymous nodes are
+                        still *traversed* so that named children nested inside
+                        anonymous parents are not missed.
 
         Yields:
             :class:`NodeInfo` for each visited node, in pre-order.
         """
-        # Explicit stack-based DFS to avoid Python recursion limits on deep trees.
         stack: list[Node] = [result.root_node]
         while stack:
             node = stack.pop()
             if named_only and not node.is_named:
-                # Still descend into children -- a named child can be under an
-                # anonymous parent (e.g. a "block" inside a ":" token's sibling).
+                # Don't yield this anonymous node, but still push its children
+                # because a named grandchild may live under an anonymous parent.
                 stack.extend(reversed(node.children))
                 continue
             yield NodeInfo.from_node(node)
-            # Push children in reverse so leftmost child is processed first.
             stack.extend(reversed(node.children))
 
     # ------------------------------------------------------------------
@@ -382,3 +443,33 @@ class ASTParser:
         if language not in self._parsers:
             self._parsers[language] = Parser(self._languages[language])
         return self._parsers[language]
+
+    def _detect_language(self, file_path: str) -> str:
+        """Infer the language from *file_path*'s extension.
+
+        Args:
+            file_path: Path whose extension is used for detection.
+
+        Returns:
+            Canonical language name (e.g. ``"python"``).
+
+        Raises:
+            ParserError: If the extension is absent or not in
+                         :data:`EXTENSION_TO_LANGUAGE`.
+        """
+        _, ext = os.path.splitext(file_path)
+        ext = ext.lower()
+        if not ext:
+            raise ParserError(
+                f"Cannot auto-detect language for '{file_path}': no file extension. "
+                "Pass language= explicitly."
+            )
+        language = EXTENSION_TO_LANGUAGE.get(ext)
+        if language is None:
+            supported = ", ".join(sorted(EXTENSION_TO_LANGUAGE))
+            raise ParserError(
+                f"Cannot auto-detect language for extension '{ext}'. "
+                f"Supported extensions: {supported}. "
+                "Pass language= explicitly to override."
+            )
+        return language
