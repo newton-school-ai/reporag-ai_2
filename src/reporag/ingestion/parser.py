@@ -21,11 +21,22 @@ from tree_sitter import Language, Parser, Tree
 
 
 @dataclass
+class NodeData:
+    """Structured information extracted from an AST node."""
+
+    type: str
+    text: str
+    start_line: int
+    end_line: int
+
+
+@dataclass
 class ParseResult:
     tree: Tree
     language: str
     has_errors: bool
     error_count: int
+    nodes: list[NodeData]
 
 
 class ASTParser:
@@ -58,6 +69,7 @@ class ASTParser:
             language=language,
             has_errors=errors > 0,
             error_count=errors,
+            nodes=[],
         )
 
     def _count_errors(self, node) -> int:
