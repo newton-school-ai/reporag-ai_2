@@ -56,9 +56,10 @@ _GRAMMAR_LOADERS: dict[str, Callable[[], object]] = {
 
 
 class ASTParser:
-
     def __init__(self) -> None:
         self._parsers: dict[str, Parser] = {}
+        self._languages: dict[str, Language] = {}
+        self.extension_map: dict[str, str] = dict(settings.extension_map)
 
     def _get_parser(self, language: str) -> Parser:
         lang = language.lower().strip()
@@ -68,19 +69,20 @@ class ASTParser:
         loader = _GRAMMAR_LOADERS.get(lang)
         if loader is None:
             raise UnsupportedLanguageError(
-                f"No parser registered for language: {language}"
+                f"No parser registered for language: {language}  "
+                f"Supported: {list(_GRAMMAR_LOADERS.keys())}"
             )
 
         try:
             ts_language = Language(loader())
-        except ImportError as e:
+        except Exception as e:
             raise UnsupportedLanguageError(
-                f"Grammar for {language!r} is not installed: {e}"
+                f"Failed to load grammar for {language}: {e}"
             ) from e
 
-        parser = Parser()
-        parser.language = ts_language
+        parser = Parser(ts_language)
         self._parsers[lang] = parser
+        self._languages[lang] = ts_language
         return parser
 
     def parse(
@@ -89,12 +91,17 @@ class ASTParser:
         language: str = "python",
     ) -> Tree:
         parser = self._get_parser(language)
+        try:
+            source_bytes = (
+                source_code.encode("utf-8")
+                if isinstance(source_code, str)
+                else source_code
+            )
 
-        source_bytes = (
-            source_code.encode("utf-8") if isinstance(source_code, str) else source_code
-        )
+            return parser.parse(source_bytes)
 
-        return parser.parse(source_bytes)
+        except Exception as e:
+            raise ParseError(f"Failed to parse source code: {e}") from e
 
     def walk(self, tree: Tree, named_only: bool = False) -> Iterator[NodeData]:
         stack = [tree.root_node]
@@ -118,6 +125,7 @@ class ASTParser:
     def _to_node_data(node: Node) -> NodeData:
         """Convert a native tree-sitter Node into structured NodeData."""
         raw = node.text if node.text is not None else b""
+
         return NodeData(
             type=node.type,
             text=raw.decode("utf-8", errors="replace"),
