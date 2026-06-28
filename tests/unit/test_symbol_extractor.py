@@ -15,6 +15,7 @@ import pytest
 
 from src.reporag.ingestion.symbol_extractor import (
     ASYNC_FUNCTION,
+    ASYNC_METHOD,
     CLASS,
     CLASS_METHOD,
     FUNCTION,
@@ -126,6 +127,52 @@ class Utils:
     def value(self) -> int:
         \"\"\"The value.\"\"\"
         return 42
+"""
+
+ASYNC_METHOD_SRC = """\
+class Service:
+    async def connect(self) -> None:
+        \"\"\"Connect to service.\"\"\"
+        pass
+
+    async def disconnect(self) -> None:
+        pass
+
+    def sync_op(self) -> None:
+        pass
+"""
+
+NESTED_FUNCTION_SRC = """\
+def outer(x: int) -> int:
+    \"\"\"Outer function.\"\"\"
+
+    def inner(y: int) -> int:
+        \"\"\"Inner function.\"\"\"
+        return x + y
+
+    def another_inner() -> None:
+        pass
+
+    return inner(x)
+"""
+
+DEEPLY_NESTED_SRC = """\
+def level_one():
+    def level_two():
+        def level_three():
+            pass
+"""
+
+NESTED_IN_METHOD_SRC = """\
+class Builder:
+    def build(self) -> None:
+        \"\"\"Build with helpers.\"\"\"
+
+        def _validate(value):
+            return value is not None
+
+        def _transform(value):
+            return str(value)
 """
 
 NESTED_CLASS = """\
@@ -677,3 +724,97 @@ def test_symbol_repr(extractor: SymbolExtractor) -> None:
     assert "function" in r
     assert "hello" in r
     assert "[" in r and "]" in r
+
+
+# ---------------------------------------------------------------------------
+# 21. Async method type (async def inside a class -> ASYNC_METHOD)
+# ---------------------------------------------------------------------------
+
+
+def test_async_method_type(extractor: SymbolExtractor) -> None:
+    """async def inside a class produces ASYNC_METHOD, not METHOD."""
+    symbols = extract(ASYNC_METHOD_SRC, extractor)
+    connect = by_name(symbols, "connect")
+    assert connect.type == ASYNC_METHOD
+
+
+def test_async_method_multiple(extractor: SymbolExtractor) -> None:
+    """All async methods in a class are classified as ASYNC_METHOD."""
+    symbols = extract(ASYNC_METHOD_SRC, extractor)
+    async_methods = by_type(symbols, ASYNC_METHOD)
+    names = {s.name for s in async_methods}
+    assert "connect" in names
+    assert "disconnect" in names
+
+
+def test_sync_method_unaffected(extractor: SymbolExtractor) -> None:
+    """Sync methods in the same class remain type METHOD."""
+    symbols = extract(ASYNC_METHOD_SRC, extractor)
+    sync_op = by_name(symbols, "sync_op")
+    assert sync_op.type == METHOD
+
+
+def test_async_method_docstring(extractor: SymbolExtractor) -> None:
+    """Async method docstring is extracted correctly."""
+    symbols = extract(ASYNC_METHOD_SRC, extractor)
+    connect = by_name(symbols, "connect")
+    assert connect.docstring == "Connect to service."
+
+
+def test_async_method_parent_class(extractor: SymbolExtractor) -> None:
+    """Async method has parent_class set to the enclosing class name."""
+    symbols = extract(ASYNC_METHOD_SRC, extractor)
+    connect = by_name(symbols, "connect")
+    assert connect.parent_class == "Service"
+
+
+# ---------------------------------------------------------------------------
+# 22. Nested function extraction
+# ---------------------------------------------------------------------------
+
+
+def test_nested_function_extracted(extractor: SymbolExtractor) -> None:
+    """Functions defined inside another function are extracted."""
+    symbols = extract(NESTED_FUNCTION_SRC, extractor)
+    names = {s.name for s in symbols}
+    assert "outer" in names
+    assert "inner" in names
+    assert "another_inner" in names
+
+
+def test_nested_function_type(extractor: SymbolExtractor) -> None:
+    """Nested functions have type FUNCTION (not method)."""
+    symbols = extract(NESTED_FUNCTION_SRC, extractor)
+    inner = by_name(symbols, "inner")
+    assert inner.type == FUNCTION
+
+
+def test_nested_function_docstring(extractor: SymbolExtractor) -> None:
+    """Docstring of a nested function is extracted."""
+    symbols = extract(NESTED_FUNCTION_SRC, extractor)
+    inner = by_name(symbols, "inner")
+    assert inner.docstring == "Inner function."
+
+
+def test_nested_function_no_parent_class(extractor: SymbolExtractor) -> None:
+    """Nested functions have parent_class='' (they are not class members)."""
+    symbols = extract(NESTED_FUNCTION_SRC, extractor)
+    inner = by_name(symbols, "inner")
+    assert inner.parent_class == ""
+
+
+def test_deeply_nested_functions_extracted(extractor: SymbolExtractor) -> None:
+    """Functions nested 3 levels deep are all extracted."""
+    symbols = extract(DEEPLY_NESTED_SRC, extractor)
+    names = {s.name for s in symbols}
+    assert "level_one" in names
+    assert "level_two" in names
+    assert "level_three" in names
+
+
+def test_nested_function_inside_method(extractor: SymbolExtractor) -> None:
+    """Helper functions defined inside a class method are extracted."""
+    symbols = extract(NESTED_IN_METHOD_SRC, extractor)
+    names = {s.name for s in symbols}
+    assert "_validate" in names
+    assert "_transform" in names

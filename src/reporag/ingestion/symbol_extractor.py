@@ -41,6 +41,7 @@ FUNCTION = "function"
 ASYNC_FUNCTION = "async_function"
 CLASS = "class"
 METHOD = "method"
+ASYNC_METHOD = "async_method"
 STATIC_METHOD = "static_method"
 CLASS_METHOD = "class_method"
 PROPERTY = "property"
@@ -218,6 +219,12 @@ class SymbolExtractor:
                     decorators=[],
                 )
                 symbols.append(sym)
+                # Recursively extract nested functions from the body
+                block = _get_child_by_type(child, ("block",))
+                if block:
+                    symbols.extend(
+                        _extract_nested_functions(block, file_path=file_path)
+                    )
             elif child.type == "class_definition":
                 class_sym, method_syms = _extract_class(child, file_path=file_path)
                 symbols.append(class_sym)
@@ -237,6 +244,11 @@ class SymbolExtractor:
                         decorators=decorators,
                     )
                     symbols.append(sym)
+                    block = _get_child_by_type(inner, ("block",))
+                    if block:
+                        symbols.extend(
+                            _extract_nested_functions(block, file_path=file_path)
+                        )
                 elif inner.type == "class_definition":
                     class_sym, method_syms = _extract_class(
                         inner, file_path=file_path, decorators=decorators
@@ -368,7 +380,9 @@ def _extract_function(
 
     is_async = _is_async(func_node)
     if parent_class:
-        sym_type = _classify_method(decorators)
+        base_type = _classify_method(decorators)
+        # Preserve async distinction for plain methods (not static/class/property)
+        sym_type = ASYNC_METHOD if (is_async and base_type == METHOD) else base_type
     else:
         sym_type = ASYNC_FUNCTION if is_async else FUNCTION
 
@@ -457,6 +471,12 @@ def _extract_methods(
                 decorators=[],
             )
             methods.append(sym)
+            # Extract nested functions defined inside this method body
+            inner_block = _get_child_by_type(child, ("block",))
+            if inner_block:
+                methods.extend(
+                    _extract_nested_functions(inner_block, file_path=file_path)
+                )
         elif child.type == "decorated_definition":
             decs = _collect_decorators(child)
             inner = _get_child_by_type(child, ("function_definition",))
@@ -468,6 +488,11 @@ def _extract_methods(
                     decorators=decs,
                 )
                 methods.append(sym)
+                inner_block = _get_child_by_type(inner, ("block",))
+                if inner_block:
+                    methods.extend(
+                        _extract_nested_functions(inner_block, file_path=file_path)
+                    )
         elif child.type == "class_definition":
             # Nested class -- extract it recursively
             nested_sym, nested_methods = _extract_class(child, file_path=file_path)
@@ -476,6 +501,54 @@ def _extract_methods(
             methods.append(nested_sym)
             methods.extend(nested_methods)
     return methods
+
+
+def _extract_nested_functions(block_node: Node, *, file_path: str) -> list[Symbol]:
+    """Recursively extract nested ``function_definition`` nodes from a block.
+
+    Walks only the direct children of *block_node*, then recurses into each
+    nested function's own block so arbitrary nesting depth is handled without
+    hitting Python's recursion limit (tree-sitter trees are shallow in practice).
+
+    Args:
+        block_node: A ``block`` node (function or method body).
+        file_path:  Path label stored in each :class:`Symbol`.
+
+    Returns:
+        List of :class:`Symbol` objects for all nested functions found.
+    """
+    nested: list[Symbol] = []
+    for child in block_node.children:
+        if child.type == "function_definition":
+            sym = _extract_function(
+                child,
+                file_path=file_path,
+                parent_class="",
+                decorators=[],
+            )
+            nested.append(sym)
+            inner_block = _get_child_by_type(child, ("block",))
+            if inner_block:
+                nested.extend(
+                    _extract_nested_functions(inner_block, file_path=file_path)
+                )
+        elif child.type == "decorated_definition":
+            decs = _collect_decorators(child)
+            inner = _get_child_by_type(child, ("function_definition",))
+            if inner:
+                sym = _extract_function(
+                    inner,
+                    file_path=file_path,
+                    parent_class="",
+                    decorators=decs,
+                )
+                nested.append(sym)
+                inner_block = _get_child_by_type(inner, ("block",))
+                if inner_block:
+                    nested.extend(
+                        _extract_nested_functions(inner_block, file_path=file_path)
+                    )
+    return nested
 
 
 def _extract_import(import_node: Node, *, file_path: str) -> list[Symbol]:
