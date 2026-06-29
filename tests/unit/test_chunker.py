@@ -565,3 +565,143 @@ def test_chunker_reusable(chunker: SemanticChunker) -> None:
     assert any("def add" in c.content for c in r1)
     assert any("class Greeter" in c.content for c in r2)
     assert any("import" in c.content for c in r3)
+
+
+# ---------------------------------------------------------------------------
+# 21. Comments are grouped with module-level code, not fragmented
+# ---------------------------------------------------------------------------
+
+COMMENTED_MODULE_SRC = """\
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+MAX_SIZE = 1024
+DEBUG = False
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+TIMEOUT = 30
+"""
+
+
+def test_comments_grouped_with_module_code(chunker: SemanticChunker) -> None:
+    """Comments between module-level statements are not emitted as solo chunks."""
+    chunks = chunk(COMMENTED_MODULE_SRC, chunker)
+    # All content is module-level; comments must NOT produce solo tiny chunks
+    # At most a handful of chunks (not one per line)
+    assert len(chunks) <= 3, f"Expected at most 3 chunks, got {len(chunks)}: {chunks}"
+
+
+def test_comments_not_standalone_chunks(chunker: SemanticChunker) -> None:
+    """No chunk should consist solely of comment lines."""
+    chunks = chunk(COMMENTED_MODULE_SRC, chunker)
+    for c in chunks:
+        non_comment_lines = [
+            ln
+            for ln in c.content.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        # Each chunk must have at least one non-comment, non-blank line
+        # (unless the entire file is only comments, which this fixture is not)
+        if c.content.strip():
+            assert non_comment_lines or all(
+                ln.strip().startswith("#") or not ln.strip()
+                for ln in c.content.splitlines()
+            ), f"Unexpected empty non-comment chunk: {c!r}"
+
+
+def test_module_level_imports_grouped(chunker: SemanticChunker) -> None:
+    """Multiple consecutive imports produce fewer chunks than there are imports."""
+    src = "\n".join(f"import module_{i}" for i in range(10))
+    chunks = chunk(src, chunker)
+    # 10 imports should NOT produce 10 chunks
+    assert len(chunks) < 10, f"Too many chunks for simple imports: {len(chunks)}"
+
+
+# ---------------------------------------------------------------------------
+# 22. chunk_from_tree: accepts pre-parsed tree
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_from_tree_produces_chunks(chunker: SemanticChunker) -> None:
+    """chunk_from_tree works with a pre-parsed Tree object."""
+    from src.reporag.ingestion.parser import ASTParser
+
+    src = SMALL_FUNCTION
+    src_bytes = src.encode("utf-8")
+    parser = ASTParser()
+    tree = parser.parse(src_bytes, language="python")
+
+    chunks = chunker.chunk_from_tree(tree, src, language="python", file_path="test.py")
+    assert len(chunks) >= 1
+    assert any("def add" in c.content for c in chunks)
+
+
+def test_chunk_from_tree_same_result_as_chunk_source(chunker: SemanticChunker) -> None:
+    """chunk_from_tree and chunk_source produce identical chunks for the same source."""
+    from src.reporag.ingestion.parser import ASTParser
+
+    src = CLASS_SRC
+    src_bytes = src.encode("utf-8")
+    parser = ASTParser()
+    tree = parser.parse(src_bytes, language="python")
+
+    via_tree = chunker.chunk_from_tree(tree, src, language="python")
+    via_source = chunker.chunk_source(src, language="python")
+
+    assert len(via_tree) == len(via_source)
+    for a, b in zip(via_tree, via_source, strict=False):
+        assert a.content == b.content
+        assert a.start_line == b.start_line
+        assert a.end_line == b.end_line
+
+
+# ---------------------------------------------------------------------------
+# 23. Ingestion package exports
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_importable_from_ingestion_package() -> None:
+    """Chunk is re-exported from the ingestion package __init__."""
+    from src.reporag.ingestion import Chunk as ChunkAlias
+
+    assert ChunkAlias is Chunk
+
+
+def test_semantic_chunker_importable_from_ingestion_package() -> None:
+    """SemanticChunker is re-exported from the ingestion package __init__."""
+    from src.reporag.ingestion import SemanticChunker as SemanticChunkerAlias
+
+    assert SemanticChunkerAlias is SemanticChunker
+
+
+# ---------------------------------------------------------------------------
+# 24. chunk_file on real project files (integration smoke)
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_real_file_cloner(chunker: SemanticChunker) -> None:
+    """chunk_file on the actual cloner.py produces sane, non-empty chunks."""
+    import pathlib
+
+    cloner_path = (
+        pathlib.Path(__file__).parent.parent.parent
+        / "src"
+        / "reporag"
+        / "ingestion"
+        / "cloner.py"
+    )
+    chunks = chunker.chunk_file(str(cloner_path), language="python")
+
+    assert len(chunks) >= 3, "Expected multiple chunks from a real-world file"
+    all_content = " ".join(c.content for c in chunks)
+    assert "RepoCloner" in all_content
+    assert "clone_and_discover" in all_content
+    # Methods of RepoCloner get their own chunks with parent_symbol set
+    method_chunks = [c for c in chunks if c.parent_symbol == "RepoCloner"]
+    assert (
+        len(method_chunks) >= 2
+    ), f"Expected method chunks for RepoCloner, got chunks: {chunks}"

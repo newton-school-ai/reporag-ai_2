@@ -172,9 +172,13 @@ class PythonChunker:
         - **Why it exists**: Drives the top-level chunking pass over the
           module root, dispatching to definition or module-level handlers.
         - **Algorithm**: Iterates over top-level named children in source
-          order. Definitions go to :meth:`_chunk_definition`; all other nodes
-          accumulate into a pending module-level buffer that is flushed when a
-          definition boundary is encountered.
+          order. Definitions (function/class) flush any pending module-level
+          buffer, then become their own chunk(s). Everything else -- imports,
+          assignments, comments, docstrings -- accumulates in the buffer and
+          is flushed as a single module-level chunk when a definition boundary
+          is hit. Comment nodes (``type == "comment"``) are intentionally
+          included in the module buffer rather than being emitted as tiny
+          standalone chunks.
         - **Edge cases**: Trailing module-level statements after the last
           definition are flushed after the loop.
         - **Correctness choice**: Uses ``named_children`` to skip anonymous
@@ -205,9 +209,12 @@ class PythonChunker:
                         )
                     )
                 else:
+                    # Malformed decorated_definition: treat as module-level text
                     pending_module_nodes.append(node)
 
             else:
+                # Imports, assignments, expression statements, comments --
+                # group all of these together in the module-level buffer.
                 pending_module_nodes.append(node)
 
         # Flush any remaining module-level nodes
@@ -275,13 +282,21 @@ class PythonChunker:
             return [chunk]
 
         # Oversized definition: split at statement boundaries
-        return self._split_definition(
+        split_chunks = self._split_definition(
             node,
             span_node=span_node,
             qualified_name=qualified_name,
             parent_symbol=parent_symbol,
             has_error=has_error,
         )
+        # For oversized classes: also emit individual method chunks so each
+        # method is independently retrievable even when the class is too large
+        # to fit in a single chunk.
+        if node.type == "class_definition":
+            split_chunks = split_chunks + self._chunk_class_methods(
+                node, parent_symbol=qualified_name
+            )
+        return split_chunks
 
     def _split_definition(
         self,
@@ -403,9 +418,9 @@ class PythonChunker:
           then individual method chunks so each method gets its own embedding.
         - **Algorithm**: Iterates over the class body's direct children,
           forwarding each function or decorated definition to
-          :meth:`_chunk_definition`.
-        - **Edge cases**: Nested classes recurse through :meth:`_chunk_definition`
-          which calls this method again, achieving arbitrary nesting.
+          :meth:`_chunk_definition`. Nested classes recurse through
+          :meth:`_chunk_definition` which calls this method again.
+        - **Edge cases**: Missing body returns empty list immediately.
         - **Correctness choice**: Methods are emitted *after* the class chunk,
           not instead of it, so the class docstring and inheritance are always
           available for retrieval.
@@ -431,11 +446,10 @@ class PythonChunker:
                         )
                     )
             elif child.type == "class_definition":
-                nested_qualified = self._qualified_name(child, parent_symbol)
+                # Nested class: emit its own chunk + its methods recursively
                 chunks.extend(
                     self._chunk_definition(child, parent_symbol=parent_symbol)
                 )
-                _ = nested_qualified  # already handled inside _chunk_definition
 
         return chunks
 
@@ -705,6 +719,37 @@ class SemanticChunker:
         """
         source_bytes = source.encode("utf-8") if isinstance(source, str) else source
         tree: Tree = self._parser.parse(source_bytes, language=language)
+        return self._chunk(tree, source_bytes, file_path=file_path, language=language)
+
+    def chunk_from_tree(
+        self,
+        tree: Tree,
+        source: str | bytes,
+        *,
+        language: str = "python",
+        file_path: str = "<string>",
+    ) -> list[Chunk]:
+        """Produce semantic chunks from an already-parsed tree-sitter Tree.
+
+        Use this method when the caller has already invoked
+        :meth:`~src.reporag.ingestion.parser.ASTParser.parse` (e.g. the
+        symbol extraction and chunking pass share one parse call for efficiency).
+
+        Args:
+            tree:      A :class:`~tree_sitter.Tree` produced by
+                       :class:`~src.reporag.ingestion.parser.ASTParser`.
+            source:    Original source code as ``str`` or ``bytes``.
+            language:  Language name stored in each :class:`Chunk`.
+            file_path: Path label stored in each :class:`Chunk`.
+
+        Returns:
+            Ordered list of :class:`Chunk` objects.
+
+        Raises:
+            UnsupportedLanguageError: If no chunker is registered for
+                *language*.
+        """
+        source_bytes = source.encode("utf-8") if isinstance(source, str) else source
         return self._chunk(tree, source_bytes, file_path=file_path, language=language)
 
     # ------------------------------------------------------------------
