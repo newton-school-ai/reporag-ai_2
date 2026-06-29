@@ -380,7 +380,7 @@ class SemanticChunker:
         """
         body = inner.child_by_field_name("body")
         statements = list(body.named_children) if body is not None else []
-        if not statements:
+        if body is None or not statements:
             return self._emit_span(
                 full.start_byte, full.end_byte, ctx, qualified, symbol_type
             )
@@ -610,7 +610,7 @@ class SemanticChunker:
     def _def_name(inner: Node) -> str:
         """Return the declared name of a function/class definition node."""
         name_node = inner.child_by_field_name("name")
-        if name_node is None:
+        if name_node is None or name_node.text is None:
             return "<anonymous>"
         return name_node.text.decode("utf-8", errors="replace")
 
