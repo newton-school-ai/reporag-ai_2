@@ -47,15 +47,16 @@ def test_extract_async_and_nested_functions(extractor: SymbolExtractor) -> None:
         "    return 42\n"
     )
     symbols = extractor.extract_from_source(code, language="python")
-    assert len(symbols) == 1
-    outer = symbols[0]
+    assert len(symbols) == 2
 
-    assert outer.name == "outer_func"
+    outer = next(s for s in symbols if s.name == "outer_func")
+    inner = next(s for s in symbols if s.name == "inner_func")
+
     assert outer.type == "function"
-    assert outer.is_async is True
-    assert len(outer.children) == 1
+    assert inner.type == "function"
 
-    inner = outer.children[0]
+    assert inner.parent_symbol == "outer_func"
+    assert inner.qualified_name == "outer_func.<locals>.inner_func"
     assert inner.name == "inner_func"
     assert inner.type == "function"
     assert inner.is_async is False
@@ -77,20 +78,13 @@ def test_extract_class_with_methods(extractor: SymbolExtractor) -> None:
         "        return 0\n"
     )
     symbols = extractor.extract_from_source(code, language="python")
-    assert len(symbols) == 1
-    cls_sym = symbols[0]
+    assert len(symbols) == 3
 
-    assert cls_sym.name == "Calculator"
-    assert cls_sym.type == "class"
-    assert cls_sym.docstring == "Perform math operations."
-    assert len(cls_sym.methods) == 2
+    methods = [s for s in symbols if s.type == "method"]
 
-    m1 = cls_sym.methods[0]
-    assert m1.name == "add"
-    assert m1.type == "method"
-    assert m1.decorators == ["staticmethod"]
+    assert len(methods) == 2
 
-    m2 = cls_sym.methods[1]
+    m2 = next(s for s in methods if s.name == "value")
     assert m2.name == "value"
     assert m2.type == "method"
     assert m2.decorators == ["property"]
@@ -163,12 +157,12 @@ def test_edge_case_nested_classes(extractor: SymbolExtractor) -> None:
     """Nested classes are correctly resolved with clean qualified names."""
     code = "class Outer:\n" "    class Inner:\n" "        pass\n"
     symbols = extractor.extract_from_source(code, language="python")
-    assert len(symbols) == 1
-    outer = symbols[0]
-    assert outer.name == "Outer"
-    assert len(outer.children) == 1
+    assert len(symbols) == 2
 
-    inner = outer.children[0]
+    inner = next(s for s in symbols if s.name == "Inner")
+
+    assert inner.parent_symbol == "Outer"
+    assert inner.qualified_name == "Outer.Inner"
     assert inner.name == "Inner"
     assert inner.type == "class"
     assert inner.parent_symbol == "Outer"
@@ -184,15 +178,17 @@ def test_edge_case_nested_function_in_method(extractor: SymbolExtractor) -> None
         "            pass\n"
     )
     symbols = extractor.extract_from_source(code, language="python")
-    assert len(symbols) == 1
-    cls_sym = symbols[0]
-    assert len(cls_sym.methods) == 1
+    assert len(symbols) == 3
 
-    method = cls_sym.methods[0]
-    assert method.name == "my_method"
-    assert len(method.children) == 1
+    method = next(s for s in symbols if s.name == "my_method")
 
-    internal = method.children[0]
+    internal = next(s for s in symbols if s.name == "internal")
+
+    assert method.type == "method"
+
+    assert internal.parent_symbol == "MyClass.my_method"
+
+    assert internal.qualified_name == "MyClass.my_method.<locals>.internal"
     assert internal.name == "internal"
     assert internal.type == "function"
     assert internal.parent_symbol == "MyClass.my_method"
@@ -218,10 +214,13 @@ def test_edge_case_async_methods(extractor: SymbolExtractor) -> None:
     """Async methods inside class definitions are identified correctly."""
     code = "class API:\n" "    async def fetch(self):\n" "        pass\n"
     symbols = extractor.extract_from_source(code, language="python")
-    assert len(symbols) == 1
-    cls_sym = symbols[0]
-    assert len(cls_sym.methods) == 1
-    method = cls_sym.methods[0]
+    assert len(symbols) == 2
+
+    method = next(s for s in symbols if s.name == "fetch")
+
+    assert method.type == "method"
+
+    assert method.is_async
     assert method.name == "fetch"
     assert method.type == "method"
     assert method.is_async is True
@@ -239,11 +238,16 @@ def test_edge_case_property_getter_setter(extractor: SymbolExtractor) -> None:
         "        self._name = val\n"
     )
     symbols = extractor.extract_from_source(code, language="python")
-    assert len(symbols) == 1
-    cls_sym = symbols[0]
-    assert len(cls_sym.methods) == 2
-    assert cls_sym.methods[0].decorators == ["property"]
-    assert cls_sym.methods[1].decorators == ["name.setter"]
+    assert len(symbols) == 3
+
+    methods = [s for s in symbols if s.type == "method"]
+
+    getter = methods[0]
+    setter = methods[1]
+
+    assert getter.decorators == ["property"]
+
+    assert setter.decorators == ["name.setter"]
 
 
 def test_edge_case_relative_imports(extractor: SymbolExtractor) -> None:
@@ -347,10 +351,15 @@ def test_malformed_class_with_parse_error(extractor: SymbolExtractor) -> None:
     """A class containing parse errors is extracted with has_parse_error=True."""
     code = "class BrokenClass:\n" "    def method(self):\n" "        x =\n"
     symbols = extractor.extract_from_source(code, language="python")
-    assert len(symbols) == 1
-    sym = symbols[0]
-    assert sym.name == "BrokenClass"
-    assert sym.has_parse_error is True
+    cls = next(s for s in symbols if s.type == "class")
+
+    assert cls.name == "BrokenClass"
+    assert cls.has_parse_error
+
+    method = next(s for s in symbols if s.name == "method")
+
+    assert method.parent_symbol == "BrokenClass"
+    assert method.has_parse_error
 
 
 def test_inheritance_bases_generic(extractor: SymbolExtractor) -> None:

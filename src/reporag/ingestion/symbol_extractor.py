@@ -136,14 +136,7 @@ class PythonSymbolExtractor:
         - **Correctness choice**: Modifies parent containers in-place during the iterative DFS traversal,
           constructing the full hierarchy in O(1) step operations.
         """
-        if not parent:
-            roots.append(sym)
-            return
-
-        if sym.type == "method" and parent.type == "class":
-            parent.methods.append(sym)
-        else:
-            parent.children.append(sym)
+        roots.append(sym)
 
     def _extract_docstring(self, block_node: Node | None) -> str | None:
         """Extract docstring string from the block node.
