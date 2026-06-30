@@ -832,6 +832,13 @@ class SemanticChunker:
                     "Pass language= explicitly or add it to settings.extension_map."
                 )
 
+        lang = language.lower().strip()
+        if lang not in _CHUNKER_REGISTRY:
+            raise UnsupportedLanguageError(
+                f"No SemanticChunker registered for language '{language}'. "
+                f"Supported: {sorted(_CHUNKER_REGISTRY)}"
+            )
+
         try:
             source_bytes = fpath.read_bytes()
         except OSError as exc:
@@ -864,6 +871,12 @@ class SemanticChunker:
             UnsupportedLanguageError: If no chunker is registered for
                 *language*.
         """
+        lang = language.lower().strip()
+        if lang not in _CHUNKER_REGISTRY:
+            raise UnsupportedLanguageError(
+                f"No SemanticChunker registered for language '{language}'. "
+                f"Supported: {sorted(_CHUNKER_REGISTRY)}"
+            )
         source_bytes = source.encode("utf-8") if isinstance(source, str) else source
         tree: Tree = self._parser.parse(source_bytes, language=language)
         return self._chunk(tree, source_bytes, file_path=file_path, language=language)
@@ -897,6 +910,12 @@ class SemanticChunker:
             UnsupportedLanguageError: If no chunker is registered for
                 *language*.
         """
+        lang = language.lower().strip()
+        if lang not in _CHUNKER_REGISTRY:
+            raise UnsupportedLanguageError(
+                f"No SemanticChunker registered for language '{language}'. "
+                f"Supported: {sorted(_CHUNKER_REGISTRY)}"
+            )
         source_bytes = source.encode("utf-8") if isinstance(source, str) else source
         return self._chunk(tree, source_bytes, file_path=file_path, language=language)
 
