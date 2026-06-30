@@ -49,7 +49,7 @@ def assert_valid_python_chunks(chunks: list[CodeChunk], parser: ASTParser) -> No
 
 
 def test_empty_source_returns_no_chunks(
-    make_chunker: Callable[[int], SemanticChunker]
+    make_chunker: Callable[[int], SemanticChunker],
 ) -> None:
     """Empty files produce no semantic chunks."""
     assert make_chunker(100).chunk_source("", file_path="empty.py") == []
