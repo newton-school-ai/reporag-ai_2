@@ -12,7 +12,7 @@ Usage::
     from src.reporag.ingestion.chunker import SemanticChunker
 
     chunker = SemanticChunker(max_tokens=512)
-    chunks = chunker.chunk_file('src/reporag/ingestion/cloner.py')
+    chunks = chunker.chunk_file('examples/sample_repo/app.py')
     for c in chunks:
         print(f'[{c.start_line}-{c.end_line}] {c.parent_symbol} ({c.token_count} tokens)')
 
@@ -52,12 +52,13 @@ def _get_encoder() -> tiktoken.Encoding:
 
 
 def count_tokens(text: str) -> int:
-    """Return the number of tokens in *text* using the shared encoder.
+    """Return the number of BPE tokens in *text* using the shared encoder.
 
     - **Why it exists**: Centralises token counting so the encoder is loaded
-      exactly once and all callers use the same budget unit.
-    - **Algorithm**: Delegates to tiktoken's BPE encoder. The result is the
-      number of BPE tokens, which closely matches OpenAI's embedding models.
+      exactly once and all callers share the same budget unit.
+    - **Algorithm**: Delegates to tiktoken's BPE encoder.  The result is the
+      number of BPE tokens, which closely matches what OpenAI's embedding
+      models consume.
     - **Edge cases**: Empty strings return 0 without invoking the encoder.
     - **Correctness choice**: Uses ``cl100k_base`` (GPT-4 encoding) so token
       counts match what the downstream embedding step will consume.
@@ -77,23 +78,23 @@ class Chunk:
     """A contiguous slice of source code with full metadata.
 
     Attributes:
-        content:        The raw source text of this chunk (UTF-8 string).
-        file_path:      Path to the originating source file, or ``"<string>"``
-                        for in-memory sources.
-        language:       Language name (e.g. ``"python"``).
-        start_line:     1-based line number where this chunk begins.
-        end_line:       1-based line number where this chunk ends (inclusive).
-        parent_symbol:  Qualified name of the enclosing function or class
-                        (e.g. ``"MyClass.my_method"``), or ``None`` for
-                        module-level code.
-        token_count:    Number of BPE tokens in *content* (pre-computed).
-        chunk_index:    0-based position of this chunk within its parent
-                        symbol.  Always 0 for single-chunk symbols.
+        content:         The raw source text of this chunk (UTF-8 string).
+        file_path:       Path to the originating source file, or ``"<string>"``
+                         for in-memory sources.
+        language:        Language name (e.g. ``"python"``).
+        start_line:      1-based line number where this chunk begins.
+        end_line:        1-based line number where this chunk ends (inclusive).
+        parent_symbol:   Qualified name of the enclosing function or class
+                         (e.g. ``"MyClass.my_method"``), or ``None`` for
+                         module-level code.
+        token_count:     Number of BPE tokens in *content* (pre-computed).
+        chunk_index:     0-based position of this chunk within its parent
+                         symbol.  Always 0 for single-chunk symbols.
         is_continuation: ``True`` when this is not the first chunk of a
                          symbol that was split across multiple chunks.
-        overlap_header: The function/class signature line repeated at the
-                        start of continuation chunks for context.  ``None``
-                        for first chunks and module-level chunks.
+        overlap_header:  The function/class signature repeated at the start
+                         of continuation chunks for embedding context.
+                         ``None`` for first chunks and module-level chunks.
         has_parse_error: ``True`` when the source contained a syntax error
                          that caused partial AST extraction.
     """
@@ -111,7 +112,7 @@ class Chunk:
     has_parse_error: bool = False
 
     def __post_init__(self) -> None:
-        """Pre-compute token_count if caller left it at the default 0."""
+        """Pre-compute token_count if the caller left it at the default 0."""
         if self.token_count == 0 and self.content:
             self.token_count = count_tokens(self.content)
 
@@ -125,6 +126,67 @@ class Chunk:
 
 
 # ---------------------------------------------------------------------------
+# Sliding-window accumulator
+# ---------------------------------------------------------------------------
+
+
+class _Accumulator:
+    """A stateful sliding window used during body and module-level splits.
+
+    Accumulates statement texts one at a time and flushes them into a
+    :class:`Chunk` when the running token total would exceed *budget*.
+
+    - **Why it exists**: Replaces the inner ``_flush`` closure pattern with a
+      proper class, eliminating ``nonlocal`` mutations and making the split
+      logic unit-testable in isolation.
+    - **Algorithm**: Maintains a *running token count* updated by adding each
+      statement's tokens individually (O(n) amortised) rather than re-encoding
+      the entire accumulated text each iteration (O(n^2)).
+    - **Correctness choice**: The ``\n`` joining separator adds no tokens in
+      cl100k_base BPE (newlines are merged into surrounding tokens), so the
+      running sum matches ``count_tokens("\n".join(texts))`` within +/-1 token.
+      This is precise enough for a chunking heuristic.
+    """
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+        self.token_total: int = 0
+        self.start_line: int | None = None
+        self.end_line: int | None = None
+
+    def is_empty(self) -> bool:
+        """Return True when no statements have been added yet."""
+        return not self.texts
+
+    def would_overflow(self, extra_tokens: int, budget: int) -> bool:
+        """Return True when adding *extra_tokens* would exceed *budget*."""
+        return bool(self.texts) and self.token_total + extra_tokens > budget
+
+    def add(self, text: str, tokens: int, start: int, end: int) -> None:
+        """Append *text* to the window, updating running counters."""
+        if self.start_line is None:
+            self.start_line = start
+        self.texts.append(text)
+        self.token_total += tokens
+        self.end_line = end
+
+    def flush(self) -> tuple[str, int, int, int]:
+        """Drain the window and return ``(joined_text, start, end, tokens)``.
+
+        Resets internal state so the accumulator is ready for the next window.
+        """
+        joined = "\n".join(self.texts)
+        start = self.start_line
+        end = self.end_line
+        tokens = self.token_total
+        self.texts = []
+        self.token_total = 0
+        self.start_line = None
+        self.end_line = None
+        return joined, start, end, tokens  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
 # Python chunker implementation
 # ---------------------------------------------------------------------------
 
@@ -134,12 +196,14 @@ class PythonChunker:
 
     Strategy
     --------
-    1. Walk the module's top-level children.
-    2. Each function/class definition becomes one or more chunks.
+    1. Walk the module's top-level named children in source order.
+    2. Each ``function_definition`` / ``class_definition`` (and
+       ``decorated_definition``) becomes one or more chunks.
     3. A definition whose token count exceeds *max_tokens* is split at
        statement boundaries inside its body with signature overlap.
-    4. Contiguous module-level statements (imports, assignments, etc.) that
-       fall between definitions are grouped into a single module-level chunk.
+    4. Contiguous module-level statements (imports, assignments, comments,
+       docstrings, etc.) that fall between definitions are grouped into a
+       single module-level chunk.
     """
 
     def __init__(
@@ -172,33 +236,31 @@ class PythonChunker:
         - **Why it exists**: Drives the top-level chunking pass over the
           module root, dispatching to definition or module-level handlers.
         - **Algorithm**: Iterates over top-level named children in source
-          order. Definitions (function/class) flush any pending module-level
-          buffer, then become their own chunk(s). Everything else -- imports,
-          assignments, comments, docstrings -- accumulates in the buffer and
-          is flushed as a single module-level chunk when a definition boundary
-          is hit. Comment nodes (``type == "comment"``) are intentionally
-          included in the module buffer rather than being emitted as tiny
-          standalone chunks.
+          order.  Definitions (``function_definition``, ``class_definition``,
+          ``decorated_definition``) flush any pending module-level buffer and
+          then become their own chunk(s).  Everything else -- imports,
+          assignments, comments, docstrings -- accumulates in the pending
+          buffer and is flushed as a single module-level chunk when a
+          definition boundary is encountered.
         - **Edge cases**: Trailing module-level statements after the last
           definition are flushed after the loop.
         - **Correctness choice**: Uses ``named_children`` to skip anonymous
           punctuation nodes that tree-sitter inserts between statements.
         """
         chunks: list[Chunk] = []
-        pending_module_nodes: list[Node] = []
+        pending: list[Node] = []
 
         for node in tree.root_node.named_children:
             if node.type in ("function_definition", "class_definition"):
-                # Flush any accumulated module-level code before this definition
-                if pending_module_nodes:
-                    chunks.extend(self._flush_module_level(pending_module_nodes))
-                    pending_module_nodes = []
+                if pending:
+                    chunks.extend(self._flush_module_level(pending))
+                    pending = []
                 chunks.extend(self._chunk_definition(node, parent_symbol=None))
 
             elif node.type == "decorated_definition":
-                if pending_module_nodes:
-                    chunks.extend(self._flush_module_level(pending_module_nodes))
-                    pending_module_nodes = []
+                if pending:
+                    chunks.extend(self._flush_module_level(pending))
+                    pending = []
                 inner = self._inner_definition(node)
                 if inner is not None:
                     chunks.extend(
@@ -210,16 +272,15 @@ class PythonChunker:
                     )
                 else:
                     # Malformed decorated_definition: treat as module-level text
-                    pending_module_nodes.append(node)
+                    pending.append(node)
 
             else:
                 # Imports, assignments, expression statements, comments --
                 # group all of these together in the module-level buffer.
-                pending_module_nodes.append(node)
+                pending.append(node)
 
-        # Flush any remaining module-level nodes
-        if pending_module_nodes:
-            chunks.extend(self._flush_module_level(pending_module_nodes))
+        if pending:
+            chunks.extend(self._flush_module_level(pending))
 
         return chunks
 
@@ -239,14 +300,15 @@ class PythonChunker:
         - **Why it exists**: Handles both small definitions (one chunk) and
           large ones that exceed the token budget (split into continuation
           chunks).
-        - **Algorithm**: First attempts to emit the whole definition as one
-          chunk. If it exceeds *max_tokens*, it extracts the signature header
-          and splits the body at statement boundaries. Each split produces a
-          new chunk prefixed by the overlap header.
-        - **Edge cases**: If even the signature alone exceeds the budget the
-          chunk is still emitted (hard lower bound: one chunk per definition,
-          never zero). If a single statement inside the body exceeds the budget
-          it is also emitted as-is.
+        - **Algorithm**: Computes the full text token count first.  If it fits
+          in *max_tokens*, the definition is emitted as a single chunk.  If it
+          exceeds the budget, :meth:`_split_definition` is called to split at
+          statement boundaries.  For class definitions, individual method
+          chunks are also emitted in either case so each method gets its own
+          embedding.
+        - **Edge cases**: If even the signature alone exceeds the budget, the
+          chunk is still emitted -- one chunk per definition is the hard lower
+          bound.
         - **Correctness choice**: Token budget is enforced on the final text
           (with overlap header prepended) so continuation chunks are never
           silently oversized.
@@ -254,14 +316,14 @@ class PythonChunker:
         qualified_name = self._qualified_name(node, parent_symbol)
         has_error = node.has_error or node.is_missing
 
-        # Use the decorated definition span if present (so decorators are included)
+        # Use the decorated definition span so decorators are included
         span_node = decorator_node if decorator_node is not None else node
         full_text = self._node_text(span_node)
         full_tokens = count_tokens(full_text)
 
         if full_tokens <= self.max_tokens:
             # Happy path: entire definition fits in one chunk
-            chunk = Chunk(
+            first_chunk = Chunk(
                 content=full_text,
                 file_path=self.file_path,
                 language=self.language,
@@ -273,15 +335,14 @@ class PythonChunker:
                 is_continuation=False,
                 has_parse_error=has_error,
             )
-            # For classes: recurse into methods so they appear as their own chunks
-            # (in addition to the full class chunk for context)
             if node.type == "class_definition":
-                return [chunk] + self._chunk_class_methods(
+                # Also emit individual method chunks for fine-grained retrieval
+                return [first_chunk] + self._chunk_class_methods(
                     node, parent_symbol=qualified_name
                 )
-            return [chunk]
+            return [first_chunk]
 
-        # Oversized definition: split at statement boundaries
+        # Oversized: split at statement boundaries
         split_chunks = self._split_definition(
             node,
             span_node=span_node,
@@ -289,10 +350,9 @@ class PythonChunker:
             parent_symbol=parent_symbol,
             has_error=has_error,
         )
-        # For oversized classes: also emit individual method chunks so each
-        # method is independently retrievable even when the class is too large
-        # to fit in a single chunk.
         if node.type == "class_definition":
+            # Even when the class itself is too large to fit in one chunk,
+            # emit individual method chunks so each is independently retrievable
             split_chunks = split_chunks + self._chunk_class_methods(
                 node, parent_symbol=qualified_name
             )
@@ -310,22 +370,21 @@ class PythonChunker:
         """Split an oversized definition at statement boundaries.
 
         - **Why it exists**: Prevents a very large function from being emitted
-          as a single chunk that exceeds the token budget.
-        - **Algorithm**: Extracts the signature header (everything up to the
-          first statement in the body). Then iterates over body statements,
-          accumulating them into a window. When adding the next statement would
-          exceed the budget, the window is flushed as a chunk and a new window
-          starts with the overlap header prepended.
-        - **Edge cases**: If the body node is missing or empty, the full text
-          is emitted as a single (possibly oversized) chunk. If a single
-          statement exceeds the budget, it is still emitted alone.
-        - **Correctness choice**: Overlap header is prepended to continuation
-          chunks *before* token counting, so the budget includes the header
-          cost.
+          as a single chunk that blows the token budget.
+        - **Algorithm**: Extracts the signature header (source bytes from the
+          span_node start up to the body block start).  Then iterates over
+          body statements using :class:`_Accumulator` to maintain an O(n)
+          running token count.  When adding the next statement would exceed
+          ``max_tokens - header_tokens``, the accumulator is flushed as a
+          chunk and a new window begins with the overlap header prepended.
+        - **Edge cases**: If the body node is missing or empty the full text
+          is emitted as a single (possibly oversized) chunk.  If a single
+          statement exceeds the budget it is still emitted alone.
+        - **Correctness choice**: The overlap header is prepended before token
+          counting so the budget includes the header cost.
         """
         body_node = node.child_by_field_name("body")
         if body_node is None or not body_node.named_children:
-            # Cannot split without a body: emit as-is
             full_text = self._node_text(span_node)
             return [
                 Chunk(
@@ -342,35 +401,27 @@ class PythonChunker:
                 )
             ]
 
-        # Build the overlap header: signature line(s) up to the body block
         overlap_header = self._extract_header(node, span_node)
+        header_tokens = count_tokens(overlap_header)
+        budget = self.max_tokens - header_tokens
 
         chunks: list[Chunk] = []
         chunk_index = 0
-        window_lines: list[str] = []
-        window_start: int | None = None
-        window_end: int | None = None
-        is_first = True
+        acc = _Accumulator()
 
-        def _flush(end_line: int) -> None:
-            nonlocal chunk_index, is_first, window_start, window_lines, window_end
-            if not window_lines:
-                return
-            body_text = "\n".join(window_lines)
-            if is_first:
-                content = f"{overlap_header}\n{body_text}"
-                is_cont = False
-            else:
-                content = f"{overlap_header}  # ... continued\n{body_text}"
-                is_cont = True
-
+        def _emit() -> None:
+            nonlocal chunk_index
+            body_text, w_start, w_end, _ = acc.flush()
+            is_cont = chunk_index > 0
+            sep = "  # ... continued" if is_cont else ""
+            content = f"{overlap_header}{sep}\n{body_text}"
             chunks.append(
                 Chunk(
                     content=content,
                     file_path=self.file_path,
                     language=self.language,
-                    start_line=window_start or (span_node.start_point[0] + 1),
-                    end_line=end_line,
+                    start_line=w_start or (span_node.start_point[0] + 1),
+                    end_line=w_end or (span_node.end_point[0] + 1),
                     parent_symbol=parent_symbol,
                     token_count=count_tokens(content),
                     chunk_index=chunk_index,
@@ -380,33 +431,24 @@ class PythonChunker:
                 )
             )
             chunk_index += 1
-            is_first = False
-            window_lines = []
-            window_start = None
-            window_end = None
-
-        header_tokens = count_tokens(overlap_header)
-        budget = self.max_tokens - header_tokens  # budget for body lines
 
         for stmt in body_node.named_children:
             stmt_text = self._node_text(stmt)
             stmt_tokens = count_tokens(stmt_text)
-            stmt_start = stmt.start_point[0] + 1
-            stmt_end = stmt.end_point[0] + 1
 
-            current_tokens = (
-                count_tokens("\n".join(window_lines)) if window_lines else 0
+            if acc.would_overflow(stmt_tokens, budget):
+                _emit()
+
+            acc.add(
+                stmt_text,
+                stmt_tokens,
+                stmt.start_point[0] + 1,
+                stmt.end_point[0] + 1,
             )
 
-            if window_lines and current_tokens + stmt_tokens > budget:
-                _flush(window_end or stmt_end)
+        if not acc.is_empty():
+            _emit()
 
-            if window_start is None:
-                window_start = stmt_start
-            window_lines.append(stmt_text)
-            window_end = stmt_end
-
-        _flush(window_end or (span_node.end_point[0] + 1))
         return chunks
 
     def _chunk_class_methods(
@@ -415,15 +457,15 @@ class PythonChunker:
         """Recursively chunk methods inside a class body.
 
         - **Why it exists**: Classes emit a full-class chunk (for context) and
-          then individual method chunks so each method gets its own embedding.
+          individual method chunks so each method gets its own embedding.
         - **Algorithm**: Iterates over the class body's direct children,
           forwarding each function or decorated definition to
-          :meth:`_chunk_definition`. Nested classes recurse through
+          :meth:`_chunk_definition`.  Nested classes recurse through
           :meth:`_chunk_definition` which calls this method again.
-        - **Edge cases**: Missing body returns empty list immediately.
+        - **Edge cases**: Missing body returns an empty list immediately.
         - **Correctness choice**: Methods are emitted *after* the class chunk,
-          not instead of it, so the class docstring and inheritance are always
-          available for retrieval.
+          not instead of it, so the class docstring and inheritance context
+          remain available for retrieval.
         """
         chunks: list[Chunk] = []
         body = class_node.child_by_field_name("body")
@@ -461,10 +503,12 @@ class PythonChunker:
         """Group a run of module-level nodes into one or more chunks.
 
         - **Why it exists**: Preserves module-level code (imports, assignments,
-          ``__all__``, top-level constants) as retrievable chunks.
-        - **Algorithm**: Concatenates node texts with newlines. If the total
-          exceeds *max_tokens* the group is split at node boundaries using the
-          same sliding-window approach as :meth:`_split_definition`.
+          ``__all__``, constants, comments) as retrievable chunks without
+          fragmenting each node into its own tiny chunk.
+        - **Algorithm**: Concatenates node texts with newlines.  If the total
+          fits within *max_tokens*, a single chunk is produced.  If not, nodes
+          are accumulated with :class:`_Accumulator` (O(n) token tracking) and
+          flushed at node boundaries into multiple continuation chunks.
         - **Edge cases**: Empty node list returns an empty list immediately.
         - **Correctness choice**: Module-level chunks have ``parent_symbol=None``
           to distinguish them from definition chunks in downstream filtering.
@@ -472,8 +516,8 @@ class PythonChunker:
         if not nodes:
             return []
 
-        lines: list[str] = [self._node_text(n) for n in nodes]
-        full_text = "\n".join(lines)
+        node_texts = [self._node_text(n) for n in nodes]
+        full_text = "\n".join(node_texts)
         full_tokens = count_tokens(full_text)
 
         if full_tokens <= self.max_tokens:
@@ -491,49 +535,45 @@ class PythonChunker:
                 )
             ]
 
-        # Split at node boundaries
+        # Split at node boundaries using O(n) accumulator
         chunks: list[Chunk] = []
         chunk_index = 0
-        window_texts: list[str] = []
-        window_start: int | None = None
-        window_end: int | None = None
+        acc = _Accumulator()
 
-        def _flush(end_line: int) -> None:
-            nonlocal chunk_index, window_texts, window_start, window_end
-            if not window_texts:
-                return
-            content = "\n".join(window_texts)
+        def _emit() -> None:
+            nonlocal chunk_index
+            content, w_start, w_end, tokens = acc.flush()
             chunks.append(
                 Chunk(
                     content=content,
                     file_path=self.file_path,
                     language=self.language,
-                    start_line=window_start or (nodes[0].start_point[0] + 1),
-                    end_line=end_line,
+                    start_line=w_start or (nodes[0].start_point[0] + 1),
+                    end_line=w_end or (nodes[-1].end_point[0] + 1),
                     parent_symbol=None,
-                    token_count=count_tokens(content),
+                    token_count=tokens,
                     chunk_index=chunk_index,
                     is_continuation=chunk_index > 0,
                 )
             )
             chunk_index += 1
-            window_texts = []
-            window_start = None
-            window_end = None
 
-        for node, text in zip(nodes, lines, strict=False):
+        for node, text in zip(nodes, node_texts, strict=False):
             node_tokens = count_tokens(text)
-            current = count_tokens("\n".join(window_texts)) if window_texts else 0
 
-            if window_texts and current + node_tokens > self.max_tokens:
-                _flush(window_end or node.end_point[0] + 1)
+            if acc.would_overflow(node_tokens, self.max_tokens):
+                _emit()
 
-            if window_start is None:
-                window_start = node.start_point[0] + 1
-            window_texts.append(text)
-            window_end = node.end_point[0] + 1
+            acc.add(
+                text,
+                node_tokens,
+                node.start_point[0] + 1,
+                node.end_point[0] + 1,
+            )
 
-        _flush(window_end or (nodes[-1].end_point[0] + 1))
+        if not acc.is_empty():
+            _emit()
+
         return chunks
 
     # ------------------------------------------------------------------
@@ -546,35 +586,34 @@ class PythonChunker:
         - **Why it exists**: Slices the original source buffer by byte offsets
           so the returned text is exactly what the author wrote, including
           comments and spacing.
-        - **Correctness choice**: Uses ``start_byte`` / ``end_byte`` instead of
-          ``node.text`` so multi-line nodes with embedded newlines are handled
-          faithfully on all platforms.
+        - **Correctness choice**: Uses ``start_byte`` / ``end_byte`` rather
+          than ``node.text`` so multi-line nodes with embedded newlines are
+          handled faithfully on all platforms.
         """
-        raw = self.source_bytes[node.start_byte : node.end_byte]
-        return raw.decode("utf-8", errors="replace")
+        return self.source_bytes[node.start_byte : node.end_byte].decode(
+            "utf-8", errors="replace"
+        )
 
     def _extract_header(self, node: Node, span_node: Node) -> str:
         """Extract the signature header for use as an overlap prefix.
 
-        - **Why it exists**: Continuation chunks need context to be useful
-          standalone. Repeating the signature (and decorator, if present) gives
-          the embedding model enough context to understand the surrounding scope.
+        - **Why it exists**: Continuation chunks need scope context to be
+          useful standalone.  Repeating the signature (and decorator, if
+          present) gives the embedding model enough context to understand the
+          enclosing scope.
         - **Algorithm**: Slices source bytes from the span_node start up to
           (but not including) the body block start byte.
-        - **Edge cases**: If the body node is missing, returns the entire
-          first line of the definition.
+        - **Edge cases**: If the body node is missing, falls back to the first
+          line of the definition.
         - **Correctness choice**: Byte-level slicing preserves the exact
-          formatting of the original source.
+          formatting of the original source, including type annotations and
+          multi-line parameter lists.
         """
         body = node.child_by_field_name("body")
         if body is None:
-            # Fallback: use first line only
-            first_line = self._node_text(span_node).splitlines()[0]
-            return first_line
+            return self._node_text(span_node).splitlines()[0]
 
-        start_byte = span_node.start_byte
-        end_byte = body.start_byte
-        header_bytes = self.source_bytes[start_byte:end_byte]
+        header_bytes = self.source_bytes[span_node.start_byte : body.start_byte]
         return header_bytes.decode("utf-8", errors="replace").rstrip()
 
     @staticmethod
@@ -584,8 +623,8 @@ class PythonChunker:
         - **Why it exists**: Downstream consumers (knowledge graph, embedding
           index) need globally unique symbol names to avoid collisions between
           ``MyClass.run`` and ``OtherClass.run``.
-        - **Algorithm**: Reads the ``name`` field child from the node using
-          tree-sitter's field API, then prepends the parent prefix.
+        - **Algorithm**: Reads the ``name`` field child using tree-sitter's
+          field API, then prepends the parent prefix.
         - **Edge cases**: Unnamed nodes (malformed ASTs) fall back to
           ``<unknown>``.
         - **Correctness choice**: Uses ``child_by_field_name("name")`` rather
@@ -604,7 +643,7 @@ class PythonChunker:
         """Return the function or class definition inside a decorated_definition.
 
         - **Why it exists**: Decorated definitions wrap the real definition in
-          an outer node. We need the inner ``function_definition`` or
+          an outer node.  We need the inner ``function_definition`` or
           ``class_definition`` to extract name and body.
         - **Algorithm**: Scans named children for the target types.
         - **Edge cases**: Returns ``None`` if none found (malformed AST).
@@ -625,7 +664,7 @@ _CHUNKER_REGISTRY: dict[str, type[PythonChunker]] = {
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Public coordinator
 # ---------------------------------------------------------------------------
 
 
@@ -724,23 +763,24 @@ class SemanticChunker:
     def chunk_from_tree(
         self,
         tree: Tree,
+        file_path: str,
         source: str | bytes,
-        *,
         language: str = "python",
-        file_path: str = "<string>",
     ) -> list[Chunk]:
         """Produce semantic chunks from an already-parsed tree-sitter Tree.
 
-        Use this method when the caller has already invoked
-        :meth:`~src.reporag.ingestion.parser.ASTParser.parse` (e.g. the
-        symbol extraction and chunking pass share one parse call for efficiency).
+        Use this when the caller already has a parsed tree (e.g. the symbol
+        extraction and chunking pass share one parse call for efficiency).
+        The signature intentionally mirrors
+        :meth:`~src.reporag.ingestion.symbol_extractor.SymbolExtractor.extract_from_tree`
+        so both can be called with the same arguments.
 
         Args:
-            tree:      A :class:`~tree_sitter.Tree` produced by
-                       :class:`~src.reporag.ingestion.parser.ASTParser`.
+            tree:      A :class:`~tree_sitter.Tree` from
+                       :meth:`~src.reporag.ingestion.parser.ASTParser.parse`.
+            file_path: Path label stored in each :class:`Chunk`.
             source:    Original source code as ``str`` or ``bytes``.
             language:  Language name stored in each :class:`Chunk`.
-            file_path: Path label stored in each :class:`Chunk`.
 
         Returns:
             Ordered list of :class:`Chunk` objects.
@@ -767,14 +807,15 @@ class SemanticChunker:
         """Dispatch to the language-specific chunker implementation.
 
         - **Why it exists**: Decouples the public API from the implementation
-          so new languages can be added to the registry without changing the
-          coordinator.
-        - **Algorithm**: Looks up the registered chunker class by language name,
-          instantiates it with the source bytes, and calls ``chunk(tree)``.
+          so new languages can be added to ``_CHUNKER_REGISTRY`` without
+          touching the coordinator.
+        - **Algorithm**: Lower-cases *language*, looks up the registered
+          chunker class, instantiates it with the source bytes, and calls
+          ``chunk(tree)``.
         - **Edge cases**: Unsupported languages raise
           :exc:`~src.reporag.ingestion.parser.UnsupportedLanguageError`
-          rather than silently returning an empty list, because a missing chunker
-          is a configuration error, not expected input.
+          rather than silently returning an empty list, because a missing
+          chunker is a configuration error, not expected input.
         - **Correctness choice**: Language name is lower-cased before registry
           lookup to match the parser's normalisation.
         """
