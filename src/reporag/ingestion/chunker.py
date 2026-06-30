@@ -24,6 +24,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -35,39 +36,44 @@ from src.reporag.ingestion.parser import ASTParser, UnsupportedLanguageError
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Token counting
-# ---------------------------------------------------------------------------
-
 # cl100k_base is the encoding used by GPT-3.5-turbo / GPT-4; it is the
 # de-facto standard for RAG token budgets.
 _ENCODING_NAME = "cl100k_base"
 _ENCODER: tiktoken.Encoding | None = None
+_TIKTOKEN_FAILED = False
 
-
-def _get_encoder() -> tiktoken.Encoding:
-    """Return the shared tiktoken encoder, loading it lazily once."""
-    global _ENCODER  # noqa: PLW0603
-    if _ENCODER is None:
-        _ENCODER = tiktoken.get_encoding(_ENCODING_NAME)
-    return _ENCODER
+# Words and standalone punctuation each count as a rough token unit. This
+# correlates well with BPE token counts for source code and serves as an
+# offline fallback.
+_HEURISTIC_RE = re.compile(r"\w+|[^\w\s]")
 
 
 def count_tokens(text: str) -> int:
-    """Return the number of BPE tokens in *text* using the shared encoder.
+    """Return the number of tokens in *text*.
 
-    - **Why it exists**: Centralises token counting so the encoder is loaded
-      exactly once and all callers share the same budget unit.
-    - **Algorithm**: Delegates to tiktoken's BPE encoder.  The result is the
-      number of BPE tokens, which closely matches what OpenAI's embedding
-      models consume.
+    - **Why it exists**: Centralises token counting. Crucially, provides a
+      regex-based heuristic fallback if ``tiktoken`` is unavailable (e.g., in
+      offline CI environments without cached encodings).
+    - **Algorithm**: Attempts to use tiktoken's BPE encoder. If that fails,
+      falls back to a regex that counts words and punctuation marks.
     - **Edge cases**: Empty strings return 0 without invoking the encoder.
-    - **Correctness choice**: Uses ``cl100k_base`` (GPT-4 encoding) so token
-      counts match what the downstream embedding step will consume.
+    - **Correctness choice**: Uses ``cl100k_base`` (GPT-4 encoding) by default
+      so token counts match what downstream embedding steps consume.
     """
     if not text:
         return 0
-    return len(_get_encoder().encode(text))
+
+    global _ENCODER, _TIKTOKEN_FAILED  # noqa: PLW0603
+    if not _TIKTOKEN_FAILED:
+        try:
+            if _ENCODER is None:
+                _ENCODER = tiktoken.get_encoding(_ENCODING_NAME)
+            return len(_ENCODER.encode(text, disallowed_special=()))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("tiktoken unavailable (%s); falling back to heuristic", exc)
+            _TIKTOKEN_FAILED = True
+
+    return len(_HEURISTIC_RE.findall(text))
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +121,8 @@ class Chunk:
         token_count:     Number of BPE tokens in *content* (pre-computed).
         chunk_index:     0-based position of this chunk within its parent
                          symbol.  Always 0 for single-chunk symbols.
+        part:            1-based part number when a symbol is split.
+        total_parts:     Total number of parts the owning symbol was split into.
         is_continuation: ``True`` when this is not the first chunk of a
                          symbol that was split across multiple chunks.
         overlap_header:  The function/class signature repeated at the start
@@ -134,6 +142,8 @@ class Chunk:
     chunk_kind: ChunkKind = "definition"
     token_count: int = 0
     chunk_index: int = 0
+    part: int = 1
+    total_parts: int = 1
     is_continuation: bool = False
     overlap_header: str | None = None
     has_parse_error: bool = False
@@ -158,7 +168,7 @@ class Chunk:
 
     def __repr__(self) -> str:
         label = self.qualified_name or self.parent_symbol or "<module>"
-        cont = " [cont]" if self.is_continuation else ""
+        cont = f" [part {self.part}/{self.total_parts}]" if self.total_parts > 1 else ""
         return (
             f"Chunk({label}{cont} [{self.start_line}-{self.end_line}]"
             f" {self.token_count} tokens)"
@@ -185,6 +195,8 @@ class Chunk:
             "chunk_kind": self.chunk_kind,
             "token_count": self.token_count,
             "chunk_index": self.chunk_index,
+            "part": self.part,
+            "total_parts": self.total_parts,
             "is_continuation": self.is_continuation,
             "overlap_header": self.overlap_header,
             "has_parse_error": self.has_parse_error,
@@ -526,6 +538,12 @@ class PythonChunker:
         if not acc.is_empty():
             _emit()
 
+        # Update total_parts and part for all chunks in this split
+        total = len(chunks)
+        for c in chunks:
+            c.total_parts = total
+            c.part = c.chunk_index + 1
+
         return chunks
 
     def _chunk_class_methods(
@@ -654,6 +672,12 @@ class PythonChunker:
 
         if not acc.is_empty():
             _emit()
+
+        # Update total_parts and part for all chunks in this split
+        total = len(chunks)
+        for c in chunks:
+            c.total_parts = total
+            c.part = c.chunk_index + 1
 
         return chunks
 

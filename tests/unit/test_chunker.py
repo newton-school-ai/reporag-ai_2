@@ -50,6 +50,16 @@ def test_count_tokens_monotone() -> None:
     assert count_tokens("hello world foo bar baz qux") > count_tokens("hi")
 
 
+def test_count_tokens_fallback_heuristic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If tiktoken is unavailable, count_tokens falls back to the regex heuristic."""
+    import src.reporag.ingestion.chunker as mod
+
+    monkeypatch.setattr(mod, "_TIKTOKEN_FAILED", True)
+    assert mod.count_tokens("hello_world(1, 2)") > 0
+    # Our regex heuristic: ["hello_world", "(", "1", ",", "2", ")"] -> 6 tokens
+    assert mod.count_tokens("hello_world(1, 2)") == 6
+
+
 # ---------------------------------------------------------------------------
 # 2. Chunk dataclass
 # ---------------------------------------------------------------------------
@@ -337,9 +347,16 @@ def test_large_function_split_into_multiple_chunks(chunker: SemanticChunker) -> 
 
 
 def test_large_function_continuation_chunks(chunker: SemanticChunker) -> None:
-    """Continuation chunks carry the signature, chunk_kind='continuation', and overlap_header."""
+    """Continuation chunks carry the signature, chunk_kind='continuation', and part metadata."""
     chunks = chunker.chunk_source(_large_function_source(), language="python")
-    cont = [c for c in chunks if c.is_continuation]
+    func_chunks = [c for c in chunks if "def process" in c.content]
+    assert len(func_chunks) > 1
+
+    for c in func_chunks:
+        assert c.total_parts == len(func_chunks)
+        assert c.part == c.chunk_index + 1
+
+    cont = [c for c in func_chunks if c.is_continuation]
     assert cont
     for c in cont:
         assert c.chunk_kind == "continuation"
