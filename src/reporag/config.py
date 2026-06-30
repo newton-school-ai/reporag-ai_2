@@ -106,6 +106,7 @@ class Settings(BaseSettings):
     # --- Ingestion ---
     max_repo_size_mb: int = 500
     clone_depth: int = 1
+    chunk_max_tokens: int = 512
     supported_languages: str = "python,javascript,typescript"
     extension_map: dict[str, str] = {
         ".py": "python",
