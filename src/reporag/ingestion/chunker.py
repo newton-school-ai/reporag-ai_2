@@ -5,7 +5,8 @@ a function mid-body. Large functions are split at logical points with
 function signature overlap.
 
 Each chunk carries rich metadata: file_path, start_line, end_line,
-parent_symbol, language, token_count, is_continuation, overlap_header.
+parent_symbol, qualified_name, chunk_kind, language, token_count,
+is_continuation, overlap_header.
 
 Usage::
 
@@ -14,7 +15,7 @@ Usage::
     chunker = SemanticChunker(max_tokens=512)
     chunks = chunker.chunk_file('examples/sample_repo/app.py')
     for c in chunks:
-        print(f'[{c.start_line}-{c.end_line}] {c.parent_symbol} ({c.token_count} tokens)')
+        print(f'[{c.start_line}-{c.end_line}] {c.qualified_name} ({c.token_count} tokens)')
 
     # Or chunk in-memory source:
     chunks = chunker.chunk_source(source_code, language='python', file_path='<string>')
@@ -25,6 +26,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import tiktoken
 from tree_sitter import Node, Tree
@@ -69,6 +71,21 @@ def count_tokens(text: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# ChunkKind type alias
+# ---------------------------------------------------------------------------
+
+ChunkKind = Literal["definition", "module", "continuation"]
+"""Discriminator for the structural role of a :class:`Chunk`.
+
+- ``"definition"`` -- the first (or only) chunk of a function or class.
+- ``"continuation"`` -- a subsequent split window of an oversized definition,
+  distinguished by ``is_continuation=True`` and an ``overlap_header``.
+- ``"module"`` -- module-level code (imports, assignments, constants, comments)
+  that sits between top-level definitions.
+"""
+
+
+# ---------------------------------------------------------------------------
 # Chunk dataclass
 # ---------------------------------------------------------------------------
 
@@ -85,8 +102,16 @@ class Chunk:
         start_line:      1-based line number where this chunk begins.
         end_line:        1-based line number where this chunk ends (inclusive).
         parent_symbol:   Qualified name of the enclosing function or class
-                         (e.g. ``"MyClass.my_method"``), or ``None`` for
-                         module-level code.
+                         (e.g. ``"MyClass"`` for a method chunk), or ``None``
+                         for module-level code.
+        qualified_name:  Fully qualified name of the symbol this chunk belongs
+                         to (e.g. ``"MyClass.my_method"``), or ``None`` for
+                         module-level chunks.  Mirrors :attr:`Symbol.qualified_name`
+                         so chunks and symbols can be joined by this key.
+        chunk_kind:      Structural role of this chunk: ``"definition"``,
+                         ``"continuation"``, or ``"module"``.  Derived
+                         automatically from *is_continuation* and *parent_symbol*
+                         in :meth:`__post_init__`.
         token_count:     Number of BPE tokens in *content* (pre-computed).
         chunk_index:     0-based position of this chunk within its parent
                          symbol.  Always 0 for single-chunk symbols.
@@ -105,6 +130,8 @@ class Chunk:
     start_line: int
     end_line: int
     parent_symbol: str | None = None
+    qualified_name: str | None = None
+    chunk_kind: ChunkKind = "definition"
     token_count: int = 0
     chunk_index: int = 0
     is_continuation: bool = False
@@ -112,17 +139,56 @@ class Chunk:
     has_parse_error: bool = False
 
     def __post_init__(self) -> None:
-        """Pre-compute token_count if the caller left it at the default 0."""
+        """Derive computed fields after construction.
+
+        - ``token_count`` is pre-computed via :func:`count_tokens` when the
+          caller leaves it at the default ``0``.
+        - ``chunk_kind`` is always derived from *is_continuation* and
+          *parent_symbol* so callers never need to set it manually.
+        """
         if self.token_count == 0 and self.content:
             self.token_count = count_tokens(self.content)
+        # Derive chunk_kind from structural fields; callers must not set it.
+        if self.is_continuation:
+            self.chunk_kind = "continuation"
+        elif self.parent_symbol is None and self.qualified_name is None:
+            self.chunk_kind = "module"
+        else:
+            self.chunk_kind = "definition"
 
     def __repr__(self) -> str:
-        sym = self.parent_symbol or "<module>"
+        label = self.qualified_name or self.parent_symbol or "<module>"
         cont = " [cont]" if self.is_continuation else ""
         return (
-            f"Chunk({sym}{cont} [{self.start_line}-{self.end_line}]"
+            f"Chunk({label}{cont} [{self.start_line}-{self.end_line}]"
             f" {self.token_count} tokens)"
         )
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serialisable representation of this chunk.
+
+        Suitable for storing as a vector-store payload (e.g. Qdrant) or
+        writing to JSONL for offline analysis.  All values are JSON-primitive
+        types (``str``, ``int``, ``bool``, ``None``).
+
+        Returns:
+            A flat dictionary containing every metadata field.
+        """
+        return {
+            "content": self.content,
+            "file_path": self.file_path,
+            "language": self.language,
+            "start_line": self.start_line,
+            "end_line": self.end_line,
+            "parent_symbol": self.parent_symbol,
+            "qualified_name": self.qualified_name,
+            "chunk_kind": self.chunk_kind,
+            "token_count": self.token_count,
+            "chunk_index": self.chunk_index,
+            "is_continuation": self.is_continuation,
+            "overlap_header": self.overlap_header,
+            "has_parse_error": self.has_parse_error,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -133,19 +199,19 @@ class Chunk:
 class _Accumulator:
     """A stateful sliding window used during body and module-level splits.
 
-    Accumulates statement texts one at a time and flushes them into a
-    :class:`Chunk` when the running token total would exceed *budget*.
+    Accumulates statement texts one at a time and signals when the running
+    token total would overflow the budget.
 
-    - **Why it exists**: Replaces the inner ``_flush`` closure pattern with a
-      proper class, eliminating ``nonlocal`` mutations and making the split
-      logic unit-testable in isolation.
-    - **Algorithm**: Maintains a *running token count* updated by adding each
-      statement's tokens individually (O(n) amortised) rather than re-encoding
-      the entire accumulated text each iteration (O(n^2)).
-    - **Correctness choice**: The ``\n`` joining separator adds no tokens in
-      cl100k_base BPE (newlines are merged into surrounding tokens), so the
-      running sum matches ``count_tokens("\n".join(texts))`` within +/-1 token.
-      This is precise enough for a chunking heuristic.
+    - **Why it exists**: Replaces inner ``_flush`` closures that mutate
+      ``nonlocal`` state.  As a proper class the logic is easy to follow and
+      straightforward to unit-test in isolation.
+    - **Algorithm**: Maintains a *running token count* updated incrementally
+      (O(n) amortised) rather than re-encoding the entire accumulated text
+      each iteration (O(n^2)).
+    - **Correctness choice**: The ``\\n`` joining separator adds negligible
+      BPE tokens in cl100k_base, so the running sum matches
+      ``count_tokens("\\n".join(texts))`` within +/-1 token -- precise enough
+      for a chunking heuristic.
     """
 
     def __init__(self) -> None:
@@ -203,7 +269,7 @@ class PythonChunker:
        statement boundaries inside its body with signature overlap.
     4. Contiguous module-level statements (imports, assignments, comments,
        docstrings, etc.) that fall between definitions are grouped into a
-       single module-level chunk.
+       single ``"module"`` chunk.
     """
 
     def __init__(
@@ -240,8 +306,8 @@ class PythonChunker:
           ``decorated_definition``) flush any pending module-level buffer and
           then become their own chunk(s).  Everything else -- imports,
           assignments, comments, docstrings -- accumulates in the pending
-          buffer and is flushed as a single module-level chunk when a
-          definition boundary is encountered.
+          buffer and is flushed as a single ``"module"`` chunk when a
+          definition boundary is hit.
         - **Edge cases**: Trailing module-level statements after the last
           definition are flushed after the loop.
         - **Correctness choice**: Uses ``named_children`` to skip anonymous
@@ -330,6 +396,7 @@ class PythonChunker:
                 start_line=span_node.start_point[0] + 1,
                 end_line=span_node.end_point[0] + 1,
                 parent_symbol=parent_symbol,
+                qualified_name=qualified_name,
                 token_count=full_tokens,
                 chunk_index=0,
                 is_continuation=False,
@@ -343,6 +410,13 @@ class PythonChunker:
             return [first_chunk]
 
         # Oversized: split at statement boundaries
+        logger.debug(
+            "Splitting '%s' (%d tokens > budget %d) in %s",
+            qualified_name,
+            full_tokens,
+            self.max_tokens,
+            self.file_path,
+        )
         split_chunks = self._split_definition(
             node,
             span_node=span_node,
@@ -381,7 +455,8 @@ class PythonChunker:
           is emitted as a single (possibly oversized) chunk.  If a single
           statement exceeds the budget it is still emitted alone.
         - **Correctness choice**: The overlap header is prepended before token
-          counting so the budget includes the header cost.
+          counting so the budget includes the header cost, preventing
+          continuation chunks from silently exceeding the limit.
         """
         body_node = node.child_by_field_name("body")
         if body_node is None or not body_node.named_children:
@@ -394,6 +469,7 @@ class PythonChunker:
                     start_line=span_node.start_point[0] + 1,
                     end_line=span_node.end_point[0] + 1,
                     parent_symbol=parent_symbol,
+                    qualified_name=qualified_name,
                     token_count=count_tokens(full_text),
                     chunk_index=0,
                     is_continuation=False,
@@ -423,6 +499,7 @@ class PythonChunker:
                     start_line=w_start or (span_node.start_point[0] + 1),
                     end_line=w_end or (span_node.end_point[0] + 1),
                     parent_symbol=parent_symbol,
+                    qualified_name=qualified_name,
                     token_count=count_tokens(content),
                     chunk_index=chunk_index,
                     is_continuation=is_cont,
@@ -500,7 +577,7 @@ class PythonChunker:
     # ------------------------------------------------------------------
 
     def _flush_module_level(self, nodes: list[Node]) -> list[Chunk]:
-        """Group a run of module-level nodes into one or more chunks.
+        """Group a run of module-level nodes into one or more ``"module"`` chunks.
 
         - **Why it exists**: Preserves module-level code (imports, assignments,
           ``__all__``, constants, comments) as retrievable chunks without
@@ -511,7 +588,9 @@ class PythonChunker:
           flushed at node boundaries into multiple continuation chunks.
         - **Edge cases**: Empty node list returns an empty list immediately.
         - **Correctness choice**: Module-level chunks have ``parent_symbol=None``
-          to distinguish them from definition chunks in downstream filtering.
+          and ``qualified_name=None`` to distinguish them from definition chunks.
+          ``chunk_kind`` is automatically set to ``"module"`` by
+          :meth:`Chunk.__post_init__`.
         """
         if not nodes:
             return []
@@ -529,6 +608,7 @@ class PythonChunker:
                     start_line=nodes[0].start_point[0] + 1,
                     end_line=nodes[-1].end_point[0] + 1,
                     parent_symbol=None,
+                    qualified_name=None,
                     token_count=full_tokens,
                     chunk_index=0,
                     is_continuation=False,
@@ -551,6 +631,7 @@ class PythonChunker:
                     start_line=w_start or (nodes[0].start_point[0] + 1),
                     end_line=w_end or (nodes[-1].end_point[0] + 1),
                     parent_symbol=None,
+                    qualified_name=None,
                     token_count=tokens,
                     chunk_index=chunk_index,
                     is_continuation=chunk_index > 0,
@@ -732,6 +813,9 @@ class SemanticChunker:
         except OSError as exc:
             raise ParseError(f"Cannot read file '{fpath}': {exc}") from exc
 
+        logger.debug(
+            "Chunking %s (%d bytes, language=%s)", fpath, len(source_bytes), language
+        )
         tree: Tree = self._parser.parse(source_bytes, language=language)
         return self._chunk(tree, source_bytes, file_path=str(fpath), language=language)
 

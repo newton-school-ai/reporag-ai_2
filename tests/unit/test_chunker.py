@@ -15,7 +15,12 @@ import pathlib
 
 import pytest
 
-from src.reporag.ingestion.chunker import Chunk, SemanticChunker, count_tokens
+from src.reporag.ingestion.chunker import (
+    Chunk,
+    SemanticChunker,
+    _Accumulator,
+    count_tokens,
+)
 from src.reporag.ingestion.parser import UnsupportedLanguageError
 
 # ---------------------------------------------------------------------------
@@ -50,7 +55,59 @@ def test_count_tokens_monotone() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. Chunk dataclass
+# 2. _Accumulator unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_accumulator_empty_on_init() -> None:
+    """A fresh _Accumulator is empty."""
+    acc = _Accumulator()
+    assert acc.is_empty()
+
+
+def test_accumulator_not_empty_after_add() -> None:
+    """Adding a statement makes the accumulator non-empty."""
+    acc = _Accumulator()
+    acc.add("x = 1", 3, 1, 1)
+    assert not acc.is_empty()
+
+
+def test_accumulator_would_not_overflow_when_empty() -> None:
+    """An empty accumulator never reports overflow (there is nothing to flush)."""
+    acc = _Accumulator()
+    assert not acc.would_overflow(extra_tokens=9999, budget=1)
+
+
+def test_accumulator_would_overflow_when_over_budget() -> None:
+    """Accumulator detects when adding tokens would exceed the budget."""
+    acc = _Accumulator()
+    acc.add("x = 1", 3, 1, 1)
+    assert acc.would_overflow(extra_tokens=200, budget=10)
+
+
+def test_accumulator_flush_returns_correct_values() -> None:
+    """flush() returns the joined text, line range, and token total."""
+    acc = _Accumulator()
+    acc.add("x = 1", 3, 5, 5)
+    acc.add("y = 2", 4, 6, 6)
+    text, start, end, tokens = acc.flush()
+    assert text == "x = 1\ny = 2"
+    assert start == 5
+    assert end == 6
+    assert tokens == 7
+
+
+def test_accumulator_flush_resets_state() -> None:
+    """After flush(), the accumulator is empty and ready for reuse."""
+    acc = _Accumulator()
+    acc.add("a = 1", 3, 1, 1)
+    acc.flush()
+    assert acc.is_empty()
+    assert acc.start_line is None
+
+
+# ---------------------------------------------------------------------------
+# 3. Chunk dataclass
 # ---------------------------------------------------------------------------
 
 
@@ -67,43 +124,151 @@ def test_chunk_post_init_computes_token_count() -> None:
     assert c.token_count == count_tokens(c.content)
 
 
-def test_chunk_repr_contains_lines_and_tokens() -> None:
-    """Chunk repr is human-readable and contains line range and token count."""
+def test_chunk_kind_module_level() -> None:
+    """A chunk with no parent_symbol and no qualified_name has chunk_kind='module'."""
     c = Chunk(
-        content="x = 1",
+        content="import os",
+        file_path="f.py",
+        language="python",
+        start_line=1,
+        end_line=1,
+        parent_symbol=None,
+        qualified_name=None,
+    )
+    assert c.chunk_kind == "module"
+
+
+def test_chunk_kind_definition() -> None:
+    """A chunk with a qualified_name and no continuation has chunk_kind='definition'."""
+    c = Chunk(
+        content="def add(a, b): return a + b",
+        file_path="f.py",
+        language="python",
+        start_line=1,
+        end_line=1,
+        qualified_name="add",
+        is_continuation=False,
+    )
+    assert c.chunk_kind == "definition"
+
+
+def test_chunk_kind_continuation() -> None:
+    """A chunk with is_continuation=True has chunk_kind='continuation'."""
+    c = Chunk(
+        content="def f():  # ... continued\n    pass",
+        file_path="f.py",
+        language="python",
+        start_line=2,
+        end_line=3,
+        qualified_name="f",
+        is_continuation=True,
+        overlap_header="def f():",
+    )
+    assert c.chunk_kind == "continuation"
+
+
+def test_chunk_kind_is_not_manually_settable() -> None:
+    """chunk_kind set at construction is overridden by __post_init__ logic."""
+    # Passing chunk_kind="module" but is_continuation=True should give "continuation"
+    c = Chunk(
+        content="pass",
+        file_path="f.py",
+        language="python",
+        start_line=1,
+        end_line=1,
+        qualified_name="f",
+        chunk_kind="module",  # type: ignore[arg-type]
+        is_continuation=True,
+    )
+    assert c.chunk_kind == "continuation"
+
+
+def test_chunk_repr_shows_qualified_name() -> None:
+    """Chunk repr uses qualified_name when available."""
+    c = Chunk(
+        content="def greet(self): pass",
         file_path="f.py",
         language="python",
         start_line=5,
         end_line=5,
+        qualified_name="Greeter.greet",
     )
-    r = repr(c)
-    assert "[5-5]" in r
-    assert "tokens" in r
+    assert "Greeter.greet" in repr(c)
+    assert "[5-5]" in repr(c)
 
 
-def test_chunk_repr_shows_parent_symbol() -> None:
-    """Chunk repr shows the parent_symbol or <module> for module-level code."""
-    with_parent = Chunk(
-        content="pass",
-        file_path="f.py",
-        language="python",
-        start_line=1,
-        end_line=1,
-        parent_symbol="MyClass",
-    )
-    without_parent = Chunk(
-        content="pass",
+def test_chunk_repr_falls_back_to_module() -> None:
+    """Chunk repr shows <module> when no qualified_name or parent_symbol."""
+    c = Chunk(
+        content="import os",
         file_path="f.py",
         language="python",
         start_line=1,
         end_line=1,
     )
-    assert "MyClass" in repr(with_parent)
-    assert "<module>" in repr(without_parent)
+    assert "<module>" in repr(c)
+
+
+def test_chunk_to_dict_has_all_keys() -> None:
+    """to_dict() returns a dict with all expected metadata keys."""
+    c = Chunk(
+        content="def f(): pass",
+        file_path="f.py",
+        language="python",
+        start_line=1,
+        end_line=1,
+        qualified_name="f",
+    )
+    d = c.to_dict()
+    expected_keys = {
+        "content",
+        "file_path",
+        "language",
+        "start_line",
+        "end_line",
+        "parent_symbol",
+        "qualified_name",
+        "chunk_kind",
+        "token_count",
+        "chunk_index",
+        "is_continuation",
+        "overlap_header",
+        "has_parse_error",
+    }
+    assert set(d.keys()) == expected_keys
+
+
+def test_chunk_to_dict_values_are_json_serialisable() -> None:
+    """to_dict() values are all JSON-primitive types (str, int, bool, None)."""
+    import json
+
+    c = Chunk(
+        content="x = 1",
+        file_path="f.py",
+        language="python",
+        start_line=1,
+        end_line=1,
+    )
+    # Must not raise
+    json.dumps(c.to_dict())
+
+
+def test_chunk_to_dict_qualified_name_field() -> None:
+    """to_dict() contains the qualified_name field value."""
+    c = Chunk(
+        content="def f(): pass",
+        file_path="f.py",
+        language="python",
+        start_line=1,
+        end_line=1,
+        qualified_name="MyClass.f",
+    )
+    assert c.to_dict()["qualified_name"] == "MyClass.f"
+    assert c.to_dict()["chunk_kind"] == "definition"
 
 
 # ---------------------------------------------------------------------------
-# 3. Empty source
+# 4. Empty source
 # ---------------------------------------------------------------------------
 
 
@@ -113,7 +278,7 @@ def test_chunk_empty_source_returns_empty_list(chunker: SemanticChunker) -> None
 
 
 # ---------------------------------------------------------------------------
-# 4. Single small function -> one chunk
+# 5. Small function -> one chunk
 # ---------------------------------------------------------------------------
 
 
@@ -148,8 +313,24 @@ def test_small_function_no_overlap_header(chunker: SemanticChunker) -> None:
     assert func_chunk.overlap_header is None
 
 
+def test_small_function_qualified_name(chunker: SemanticChunker) -> None:
+    """A module-level function chunk carries qualified_name equal to its name."""
+    code = "def add(a: int, b: int) -> int:\n    return a + b\n"
+    chunks = chunker.chunk_source(code, language="python")
+    func_chunk = next(c for c in chunks if "def add" in c.content)
+    assert func_chunk.qualified_name == "add"
+
+
+def test_small_function_chunk_kind(chunker: SemanticChunker) -> None:
+    """A module-level function chunk has chunk_kind='definition'."""
+    code = "def add(a: int, b: int) -> int:\n    return a + b\n"
+    chunks = chunker.chunk_source(code, language="python")
+    func_chunk = next(c for c in chunks if "def add" in c.content)
+    assert func_chunk.chunk_kind == "definition"
+
+
 # ---------------------------------------------------------------------------
-# 5. Chunk metadata fields
+# 6. Chunk metadata fields
 # ---------------------------------------------------------------------------
 
 
@@ -189,7 +370,7 @@ def test_chunk_token_count_matches_content(chunker: SemanticChunker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. Async function
+# 7. Async function
 # ---------------------------------------------------------------------------
 
 
@@ -203,7 +384,7 @@ def test_async_function_chunked(chunker: SemanticChunker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 7. Class chunking
+# 8. Class chunking
 # ---------------------------------------------------------------------------
 
 
@@ -250,8 +431,17 @@ def test_method_chunks_have_parent_symbol(chunker: SemanticChunker) -> None:
     assert len(method_chunks) >= 2
 
 
+def test_method_chunks_have_qualified_name(chunker: SemanticChunker) -> None:
+    """Method chunks carry qualified_name of the form 'ClassName.method_name'."""
+    code = "class Greeter:\n" "    def greet(self) -> str:\n" '        return "hello"\n'
+    chunks = chunker.chunk_source(code, language="python")
+    greet_chunk = next((c for c in chunks if c.parent_symbol == "Greeter"), None)
+    assert greet_chunk is not None
+    assert greet_chunk.qualified_name == "Greeter.greet"
+
+
 # ---------------------------------------------------------------------------
-# 8. Decorated function and class
+# 9. Decorated function and class
 # ---------------------------------------------------------------------------
 
 
@@ -278,7 +468,7 @@ def test_decorated_class_includes_decorator(chunker: SemanticChunker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 9. Module-level code
+# 10. Module-level code
 # ---------------------------------------------------------------------------
 
 
@@ -289,11 +479,19 @@ def test_module_imports_appear_in_chunks(chunker: SemanticChunker) -> None:
     assert any("import" in c.content for c in chunks)
 
 
-def test_module_level_chunks_have_no_parent_symbol(chunker: SemanticChunker) -> None:
-    """Module-level chunks have parent_symbol=None."""
+def test_module_level_chunks_have_chunk_kind_module(chunker: SemanticChunker) -> None:
+    """Module-level chunks have chunk_kind='module'."""
     code = "import os\nCONSTANT = 42\n"
     chunks = chunker.chunk_source(code, language="python")
-    assert any(c.parent_symbol is None for c in chunks)
+    assert any(c.chunk_kind == "module" for c in chunks)
+
+
+def test_module_level_chunks_have_no_qualified_name(chunker: SemanticChunker) -> None:
+    """Module-level chunks have qualified_name=None."""
+    code = "import os\nCONSTANT = 42\n"
+    chunks = chunker.chunk_source(code, language="python")
+    module_chunks = [c for c in chunks if c.chunk_kind == "module"]
+    assert all(c.qualified_name is None for c in module_chunks)
 
 
 def test_module_level_comments_grouped_not_fragmented(
@@ -315,7 +513,6 @@ def test_module_level_comments_grouped_not_fragmented(
         "TIMEOUT = 30\n"
     )
     chunks = chunker.chunk_source(code, language="python")
-    # All content is module-level; must NOT fragment into one chunk per line
     assert len(chunks) <= 3
 
 
@@ -327,7 +524,7 @@ def test_consecutive_imports_grouped(chunker: SemanticChunker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 10. Large function splitting
+# 11. Large function splitting
 # ---------------------------------------------------------------------------
 
 
@@ -353,11 +550,19 @@ def test_large_function_continuation_flag(chunker: SemanticChunker) -> None:
     assert any(c.is_continuation for c in chunks)
 
 
+def test_large_function_continuation_chunk_kind(chunker: SemanticChunker) -> None:
+    """Continuation chunks have chunk_kind='continuation'."""
+    chunks = chunker.chunk_source(_large_function_source(), language="python")
+    cont = [c for c in chunks if c.is_continuation]
+    assert cont
+    assert all(c.chunk_kind == "continuation" for c in cont)
+
+
 def test_large_function_overlap_header_present(chunker: SemanticChunker) -> None:
     """Every continuation chunk carries an overlap_header."""
     chunks = chunker.chunk_source(_large_function_source(), language="python")
     cont_chunks = [c for c in chunks if c.is_continuation]
-    assert cont_chunks, "No continuation chunks produced"
+    assert cont_chunks
     assert all(c.overlap_header is not None for c in cont_chunks)
 
 
@@ -366,6 +571,15 @@ def test_large_function_signature_in_continuation(chunker: SemanticChunker) -> N
     chunks = chunker.chunk_source(_large_function_source(), language="python")
     cont_chunks = [c for c in chunks if c.is_continuation]
     assert all("def process" in c.content for c in cont_chunks)
+
+
+def test_large_function_qualified_name_on_all_chunks(
+    chunker: SemanticChunker,
+) -> None:
+    """All split chunks of a function carry the same qualified_name."""
+    chunks = chunker.chunk_source(_large_function_source(), language="python")
+    func_chunks = [c for c in chunks if "def process" in c.content]
+    assert all(c.qualified_name == "process" for c in func_chunks)
 
 
 def test_large_function_chunk_index_ascending(chunker: SemanticChunker) -> None:
@@ -378,14 +592,14 @@ def test_large_function_chunk_index_ascending(chunker: SemanticChunker) -> None:
 
 def test_first_chunk_never_a_continuation(chunker: SemanticChunker) -> None:
     """The first chunk (chunk_index=0) of any definition is not a continuation."""
-    code = "class MyClass:\n" "    def method(self): pass\n"
+    code = "class MyClass:\n    def method(self): pass\n"
     chunks = chunker.chunk_source(code, language="python")
     first_chunks = [c for c in chunks if c.chunk_index == 0]
     assert all(not c.is_continuation for c in first_chunks)
 
 
 # ---------------------------------------------------------------------------
-# 11. Token budget
+# 12. Token budget
 # ---------------------------------------------------------------------------
 
 
@@ -405,7 +619,7 @@ def test_smaller_budget_produces_more_chunks() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 12. Nested class
+# 13. Nested class
 # ---------------------------------------------------------------------------
 
 
@@ -428,7 +642,7 @@ def test_nested_class_both_levels_present(chunker: SemanticChunker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 13. Syntax error tolerance
+# 14. Syntax error tolerance
 # ---------------------------------------------------------------------------
 
 
@@ -439,7 +653,7 @@ def test_syntax_error_does_not_raise(chunker: SemanticChunker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 14. chunk_file from disk
+# 15. chunk_file from disk
 # ---------------------------------------------------------------------------
 
 
@@ -466,7 +680,7 @@ def test_chunk_file_infers_language_from_extension(
 
 
 # ---------------------------------------------------------------------------
-# 15. chunk_from_tree
+# 16. chunk_from_tree
 # ---------------------------------------------------------------------------
 
 
@@ -474,7 +688,7 @@ def test_chunk_from_tree_same_as_chunk_source(chunker: SemanticChunker) -> None:
     """chunk_from_tree and chunk_source produce identical results."""
     from src.reporag.ingestion.parser import ASTParser
 
-    src = "class Greeter:\n" "    def greet(self) -> str:\n" '        return "hello"\n'
+    src = "class Greeter:\n    def greet(self) -> str:\n        return 'hello'\n"
     src_bytes = src.encode("utf-8")
     parser = ASTParser()
     tree = parser.parse(src_bytes, language="python")
@@ -500,7 +714,7 @@ def test_chunk_from_tree_carries_file_path(chunker: SemanticChunker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 16. Unsupported language
+# 17. Unsupported language
 # ---------------------------------------------------------------------------
 
 
@@ -511,7 +725,7 @@ def test_unsupported_language_raises(chunker: SemanticChunker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 17. Chunker reuse across calls
+# 18. Chunker reuse across calls
 # ---------------------------------------------------------------------------
 
 
@@ -527,7 +741,7 @@ def test_chunker_reusable_across_calls(chunker: SemanticChunker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 18. Ingestion package exports
+# 19. Ingestion package exports
 # ---------------------------------------------------------------------------
 
 
@@ -546,7 +760,7 @@ def test_semantic_chunker_exported_from_ingestion_package() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 19. Integration: spec example on examples/sample_repo/app.py
+# 20. Integration: spec example on examples/sample_repo/app.py
 # ---------------------------------------------------------------------------
 
 
@@ -573,12 +787,14 @@ def test_spec_example_on_sample_repo() -> None:
     all_content = " ".join(c.content for c in chunks)
     assert "handle_login" in all_content
     assert "handle_profile" in all_content
-    # All chunks reference the correct file
     assert all(str(sample) in c.file_path for c in chunks)
+    # Function chunks must have qualified names
+    assert any(c.qualified_name == "handle_login" for c in chunks)
+    assert any(c.qualified_name == "handle_profile" for c in chunks)
 
 
 # ---------------------------------------------------------------------------
-# 20. Integration: real-world file (cloner.py)
+# 21. Integration: real-world file (cloner.py)
 # ---------------------------------------------------------------------------
 
 
@@ -600,3 +816,5 @@ def test_chunk_real_file_cloner(chunker: SemanticChunker) -> None:
     # Methods of RepoCloner must get their own chunks with parent_symbol set
     method_chunks = [c for c in chunks if c.parent_symbol == "RepoCloner"]
     assert len(method_chunks) >= 2
+    # Method chunks must have dot-qualified names
+    assert all("RepoCloner." in (c.qualified_name or "") for c in method_chunks)
