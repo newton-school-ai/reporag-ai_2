@@ -23,9 +23,12 @@ code.  The resolver handles the cases that carry the most signal:
   ``constructor``.
 * **Attribute calls on modules** -- ``import db`` then ``db.get_user()``
   resolves through the module import.
-* **Attribute calls on values** -- ``obj.method()`` cannot be typed statically,
-  so it is resolved only when exactly one project method shares that name
-  (an *inferred* edge, flagged as such so downstream consumers can weigh it).
+* **Attribute calls on values** -- ``obj.method()`` is resolved by inferring
+  ``obj``'s concrete class from a local constructor assignment (``obj = User()``)
+  or a type annotation (``obj: User``), then looking the method up on that class
+  (walking known base classes).  Resolution is *sound*: when the receiver's type
+  cannot be determined the call is left unresolved rather than guessed, so the
+  graph never contains a fabricated edge.
 
 Everything the resolver cannot pin to a project symbol (builtins, third-party
 calls such as ``hashlib.sha256``) is dropped by default and can be surfaced via
@@ -98,10 +101,14 @@ Resolution = Literal["local", "imported", "inferred", "unresolved"]
 - ``"local"``      -- a definition in the *same file* (includes recursion and
   ``self.method`` resolved within the enclosing class).
 - ``"imported"``   -- reached through an import binding into another file.
-- ``"inferred"``   -- best-effort ``obj.method`` match (exactly one project
-  method with that name); may be a false positive, so it is flagged.
+- ``"inferred"``   -- an ``obj.method`` call resolved by inferring the receiver's
+  concrete class from a local constructor assignment (``obj = User()``) or a
+  type annotation (``obj: User`` / ``def f(obj: User)``).  This is *sound*: the
+  edge is emitted only when the receiver's type is actually determined -- never
+  by guessing from a method name -- so it does not produce false positives.
 - ``"unresolved"`` -- no project symbol matched (builtin / third-party /
-  dynamic).  Emitted only when ``include_unresolved=True``.
+  dynamic, or a receiver whose type could not be determined).  Emitted only
+  when ``include_unresolved=True``.
 """
 
 
@@ -378,8 +385,6 @@ class _ResolutionContext:
         self._imports: dict[str, dict[str, Symbol]] = {}
         # file -> [module dotted names imported via ``from X import *``]
         self._wildcards: dict[str, list[str]] = {}
-        # method name -> [Symbol] across the whole project
-        self._methods_by_name: dict[str, list[Symbol]] = {}
         # file -> _EnclosingIndex
         self._enclosing: dict[str, _EnclosingIndex] = {}
 
@@ -410,8 +415,6 @@ class _ResolutionContext:
             local_defs.setdefault(sym.name, []).append(sym)
             if sym.parent_symbol is None:
                 module_level[sym.name] = sym
-            if sym.type == "method":
-                self._methods_by_name.setdefault(sym.name, []).append(sym)
 
         self._module_level[file_path] = module_level
         self._local_defs[file_path] = local_defs
@@ -523,18 +526,28 @@ class _ResolutionContext:
         receiver_is_self: bool,
         file_path: str,
         enclosing_class: str | None,
+        receiver_type: Symbol | None,
     ) -> tuple[Symbol, Resolution] | None:
         """Resolve an attribute call ``receiver.name()`` to a project symbol.
 
         Resolution order: ``self``/``cls`` against the enclosing class ->
-        ``module.name`` through a module import -> a unique project method by
-        name (inferred).
+        ``module.name`` through a module import -> ``obj.name`` against the
+        receiver's inferred concrete class (*receiver_type*).  Every tier is
+        sound: an edge is emitted only when a definite target is found -- no
+        name-based guessing -- so unresolved receivers yield no edge.
+
+        Args:
+            receiver_type: The class the receiver was inferred to hold (from a
+                local constructor assignment or annotation), or ``None`` when
+                the receiver's type could not be determined.
         """
-        # 1. self.method / cls.method -> the enclosing class's method.
+        # 1. self.method / cls.method -> the enclosing class (walking bases).
         if receiver_is_self and enclosing_class is not None:
-            sym = self._by_qualified.get(file_path, {}).get(f"{enclosing_class}.{name}")
-            if sym is not None:
-                return sym, "local"
+            enclosing = self.class_symbol(file_path, enclosing_class)
+            if enclosing is not None:
+                method = self.find_method(enclosing, name)
+                if method is not None:
+                    return method, "local"
 
         # 2. module.func -> ``import module`` then ``module.func()``.
         if receiver is not None and not receiver_is_self:
@@ -544,10 +557,11 @@ class _ResolutionContext:
                 if sym is not None:
                     return sym, "imported"
 
-        # 3. obj.method -> exactly one project method with that name.
-        methods = self._methods_by_name.get(name, [])
-        if len(methods) == 1:
-            return methods[0], "inferred"
+        # 3. obj.method -> the method on the receiver's inferred class.
+        if receiver_type is not None:
+            method = self.find_method(receiver_type, name)
+            if method is not None:
+                return method, "inferred"
 
         return None
 
@@ -576,6 +590,249 @@ class _ResolutionContext:
             return source
         # ``from p import sub`` used as a module attribute -> submodule p.sub.
         return f"{source}.{imp.name}" if source else imp.name
+
+    # ------------------------------------------------------------------
+    # Class / method resolution (used by receiver-type inference)
+    # ------------------------------------------------------------------
+
+    def class_symbol(self, file_path: str, qualified_name: str) -> Symbol | None:
+        """Return the class Symbol for a qualified name in *file_path*."""
+        sym = self._by_qualified.get(file_path, {}).get(qualified_name)
+        return sym if sym is not None and sym.type == "class" else None
+
+    def resolve_class_name(self, name: str, file_path: str) -> Symbol | None:
+        """Resolve a bare class *name* (local or imported) to its class Symbol.
+
+        Reuses bare-call resolution and keeps the result only when it is a
+        class, so ``obj = User()`` and ``obj: User`` both find ``class User``.
+        """
+        resolved = self.resolve_bare(name, file_path)
+        if resolved is not None and resolved[0].type == "class":
+            return resolved[0]
+        return None
+
+    def find_method(self, class_sym: Symbol, method_name: str) -> Symbol | None:
+        """Find *method_name* on *class_sym*, walking known base classes (MRO).
+
+        - **Why it exists**: Methods are frequently inherited; resolving only
+          the class's own methods would miss ``self.base_method()`` calls.
+        - **Algorithm**: Depth-first search from the class over base classes
+          that resolve to *known project* classes, returning the first matching
+          method.  A ``visited`` set guards against inheritance cycles.
+        - **Edge cases**: Bases that are generic/subscripted (``Generic[T]``),
+          dotted (``pkg.Base``), or third-party are skipped -- unknown bases are
+          never followed, so the search stays sound (it may miss an inherited
+          method but never invents one).
+        """
+        visited: set[tuple[str, str]] = set()
+        stack: list[Symbol] = [class_sym]
+        while stack:
+            cls = stack.pop()
+            key = (cls.file_path, cls.qualified_name or cls.name)
+            if key in visited:
+                continue
+            visited.add(key)
+
+            qualified = cls.qualified_name or cls.name
+            method = self._by_qualified.get(cls.file_path, {}).get(
+                f"{qualified}.{method_name}"
+            )
+            if method is not None and method.type in ("method", "function"):
+                return method
+
+            for base in cls.bases:
+                if "." in base or "[" in base:
+                    continue  # dotted / generic bases cannot be resolved soundly
+                base_cls = self.resolve_class_name(base, cls.file_path)
+                if base_cls is not None:
+                    stack.append(base_cls)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Receiver-type inference (Python)
+# ---------------------------------------------------------------------------
+
+
+class _PythonTypeIndex:
+    """Infers the concrete class held by local variables, per function scope.
+
+    - **Why it exists**: Resolving ``obj.method()`` requires knowing ``obj``'s
+      type.  This index answers "at line *L*, what class does ``obj`` hold?"
+      soundly, so ``obj.method`` edges are emitted only when the type is
+      actually known -- never guessed from a method name.
+    - **Algorithm**: For each function it records variable types from two sound
+      sources: (1) type annotations on parameters and annotated assignments
+      (``obj: User``), which are treated as authoritative, and (2) a variable
+      assigned *exactly once* to a constructor of a known class
+      (``obj = User()``).  A variable with an annotation, or a single
+      constructor assignment, has a known type; anything reassigned without an
+      annotation is left unknown.
+    - **Edge cases**: Tuple-unpacking targets, subscripted annotations
+      (``list[User]``), dotted annotations (``pkg.User``), and constructors of
+      unknown classes are all ignored -- they never yield a type, so they never
+      yield a fabricated edge.
+    - **Correctness choice**: Nested function/class bodies are treated as
+      separate scopes (traversal stops at their boundary); a call at line *L*
+      sees the merged variable types of every enclosing function scope, with the
+      innermost scope shadowing outer ones -- matching Python's lexical scoping.
+    """
+
+    def __init__(self, tree: Tree, file_path: str, context: _ResolutionContext) -> None:
+        """Index variable types for every function scope in *tree*."""
+        self._file_path = file_path
+        self._context = context
+        # (start_line, end_line, {var_name -> class Symbol})
+        self._scopes: list[tuple[int, int, dict[str, Symbol]]] = []
+        self._index_functions(tree)
+
+    def class_for(self, var: str, line: int) -> Symbol | None:
+        """Return the class *var* holds at *line*, or ``None`` if unknown.
+
+        When multiple enclosing scopes define *var*, the innermost (largest
+        ``start_line``) wins, mirroring lexical shadowing.
+        """
+        result: Symbol | None = None
+        best_start = -1
+        for start, end, types in self._scopes:
+            if start <= line <= end and var in types and start > best_start:
+                best_start = start
+                result = types[var]
+        return result
+
+    # ------------------------------------------------------------------
+    # Index construction
+    # ------------------------------------------------------------------
+
+    def _index_functions(self, tree: Tree) -> None:
+        """Record a scope entry for every ``function_definition`` node."""
+        stack: list[Node] = [tree.root_node]
+        while stack:
+            node = stack.pop()
+            if node.type == "function_definition":
+                types = self._scope_types(node)
+                if types:
+                    self._scopes.append(
+                        (node.start_point[0] + 1, node.end_point[0] + 1, types)
+                    )
+            stack.extend(node.children)
+
+    def _scope_types(self, func_node: Node) -> dict[str, Symbol]:
+        """Compute ``{var -> class Symbol}`` for one function scope."""
+        annotations: dict[str, Symbol] = {}
+        constructors: dict[str, Symbol] = {}
+        assign_counts: dict[str, int] = {}
+
+        params = func_node.child_by_field_name("parameters")
+        if params is not None:
+            self._collect_param_types(params, annotations)
+
+        body = func_node.child_by_field_name("body")
+        if body is not None:
+            self._collect_body_types(body, annotations, constructors, assign_counts)
+
+        types: dict[str, Symbol] = {}
+        # Constructor inference: sound only for a single, unambiguous assignment.
+        for name, cls in constructors.items():
+            if assign_counts.get(name, 0) == 1:
+                types[name] = cls
+        # Annotations are authoritative and override constructor inference,
+        # but a parameter reassigned in the body is left to the rules above.
+        for name, cls in annotations.items():
+            if name in assign_counts and name not in constructors:
+                # Reassigned to something untyped: too risky, keep it unknown.
+                continue
+            types[name] = cls
+        return types
+
+    def _collect_param_types(
+        self, params: Node, annotations: dict[str, Symbol]
+    ) -> None:
+        """Record parameter annotations that name a known class."""
+        for param in params.named_children:
+            if param.type not in ("typed_parameter", "typed_default_parameter"):
+                continue
+            name_node = self._param_name(param)
+            type_node = param.child_by_field_name("type")
+            if name_node is None or type_node is None:
+                continue
+            cls = self._class_from_annotation(type_node)
+            if cls is not None:
+                annotations[_node_text(name_node)] = cls
+
+    @staticmethod
+    def _param_name(param: Node) -> Node | None:
+        """Return the identifier naming a typed parameter."""
+        name_node = param.child_by_field_name("name")
+        if name_node is not None:
+            return name_node
+        for child in param.named_children:
+            if child.type == "identifier":
+                return child
+        return None
+
+    def _collect_body_types(
+        self,
+        body: Node,
+        annotations: dict[str, Symbol],
+        constructors: dict[str, Symbol],
+        assign_counts: dict[str, int],
+    ) -> None:
+        """Scan a function body for annotated / constructor assignments.
+
+        Traverses the whole body but stops at nested function/class/lambda
+        boundaries so that inner scopes do not leak into this one.
+        """
+        stack: list[Node] = list(body.children)
+        while stack:
+            node = stack.pop()
+            if node.type in ("function_definition", "class_definition", "lambda"):
+                continue  # a separate scope
+            if node.type == "assignment":
+                self._record_assignment(node, annotations, constructors, assign_counts)
+            stack.extend(node.children)
+
+    def _record_assignment(
+        self,
+        node: Node,
+        annotations: dict[str, Symbol],
+        constructors: dict[str, Symbol],
+        assign_counts: dict[str, int],
+    ) -> None:
+        """Record one ``assignment`` node's target type, if determinable."""
+        left = node.child_by_field_name("left")
+        if left is None or left.type != "identifier":
+            return  # skip tuple-unpacking and attribute/subscript targets
+        name = _node_text(left)
+        assign_counts[name] = assign_counts.get(name, 0) + 1
+
+        type_node = node.child_by_field_name("type")
+        if type_node is not None:
+            cls = self._class_from_annotation(type_node)
+            if cls is not None:
+                annotations[name] = cls
+
+        right = node.child_by_field_name("right")
+        if right is not None and right.type == "call":
+            func = right.child_by_field_name("function")
+            if func is not None and func.type == "identifier":
+                cls = self._context.resolve_class_name(
+                    _node_text(func), self._file_path
+                )
+                if cls is not None:
+                    constructors[name] = cls
+
+    def _class_from_annotation(self, type_node: Node) -> Symbol | None:
+        """Resolve a ``type`` annotation node to a class Symbol, if it is one.
+
+        Only bare-name annotations (``User``) are honoured; subscripted
+        (``list[User]``) and dotted (``pkg.User``) annotations are ignored so
+        the inferred type is never wider or wrong.
+        """
+        inner = type_node.named_children[0] if type_node.named_children else None
+        if inner is None or inner.type != "identifier":
+            return None
+        return self._context.resolve_class_name(_node_text(inner), self._file_path)
 
 
 # ---------------------------------------------------------------------------
@@ -828,7 +1085,8 @@ class CallGraphBuilder:
         - **Why it exists**: Central pass that ties together call-site discovery
           and cross-file resolution.
         - **Algorithm**: Builds one global :class:`_ResolutionContext` from all
-          symbols, then for each file finds its call sites and resolves each
+          symbols plus a per-file :class:`_PythonTypeIndex` for receiver-type
+          inference, then for each file finds its call sites and resolves each
           against that shared context.
         - **Edge cases**: Unresolved calls are only emitted when
           ``include_unresolved`` is set; otherwise they are dropped so the
@@ -845,8 +1103,9 @@ class CallGraphBuilder:
             finder = _CALL_SITE_FINDERS.get(language)
             if finder is None:
                 continue
+            type_index = _PythonTypeIndex(tree, file_path, context)
             for raw in finder(tree):
-                edge = self._resolve_call(raw, file_path, context)
+                edge = self._resolve_call(raw, file_path, context, type_index)
                 if edge is None:
                     continue
                 if edge.resolution == "unresolved" and not include_unresolved:
@@ -861,6 +1120,7 @@ class CallGraphBuilder:
         raw: _RawCall,
         file_path: str,
         context: _ResolutionContext,
+        type_index: _PythonTypeIndex,
     ) -> CallEdge | None:
         """Resolve one raw call site into a :class:`CallEdge`.
 
@@ -870,12 +1130,16 @@ class CallGraphBuilder:
         enclosure = context.enclosure(file_path, raw.line)
 
         if raw.is_attribute:
+            receiver_type: Symbol | None = None
+            if raw.receiver is not None and not raw.receiver_is_self:
+                receiver_type = type_index.class_for(raw.receiver, raw.line)
             resolved = context.resolve_attribute(
                 raw.callee_name,
                 raw.receiver,
                 raw.receiver_is_self,
                 file_path,
                 enclosure.enclosing_class,
+                receiver_type,
             )
         else:
             resolved = context.resolve_bare(raw.callee_name, file_path)

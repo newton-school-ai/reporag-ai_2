@@ -165,14 +165,32 @@ def test_self_method_disambiguated_by_enclosing_class(
     assert not any(e.caller == "A.run" and e.callee == "B.work" for e in edges)
 
 
-def test_obj_method_inferred_when_unique(builder: CallGraphBuilder) -> None:
-    """``obj.method()`` is inferred when exactly one project method matches."""
+def test_obj_method_inferred_from_constructor(builder: CallGraphBuilder) -> None:
+    """``obj = User(); obj.method()`` resolves via the receiver's inferred type."""
     code = (
         "class Widget:\n"
         "    def render(self):\n"
         "        return 1\n"
         "\n"
-        "def draw(w):\n"
+        "def draw():\n"
+        "    w = Widget()\n"
+        "    return w.render()\n"
+    )
+    edges = builder.build_from_sources({"m.py": code})
+    edge = _edge(edges, "draw", "Widget.render")
+    assert edge.resolution == "inferred"
+    assert edge.call_type == "method"
+    assert edge.callee_file == "m.py"
+
+
+def test_obj_method_inferred_from_annotation(builder: CallGraphBuilder) -> None:
+    """A parameter annotation types the receiver so ``obj.method()`` resolves."""
+    code = (
+        "class Widget:\n"
+        "    def render(self):\n"
+        "        return 1\n"
+        "\n"
+        "def draw(w: Widget):\n"
         "    return w.render()\n"
     )
     edges = builder.build_from_sources({"m.py": code})
@@ -181,8 +199,52 @@ def test_obj_method_inferred_when_unique(builder: CallGraphBuilder) -> None:
     assert edge.call_type == "method"
 
 
-def test_obj_method_ambiguous_stays_unresolved(builder: CallGraphBuilder) -> None:
-    """When two classes share a method name, ``obj.method()`` is not inferred."""
+def test_obj_method_untyped_receiver_stays_unresolved(
+    builder: CallGraphBuilder,
+) -> None:
+    """An untyped receiver is never guessed by method name -- no false positive.
+
+    Even though ``Widget.render`` is the only ``render`` in the project, an
+    untyped ``w`` must not be attributed to it.
+    """
+    code = (
+        "class Widget:\n"
+        "    def render(self):\n"
+        "        return 1\n"
+        "\n"
+        "def draw(w):\n"
+        "    return w.render()\n"
+    )
+    edges = builder.build_from_sources({"m.py": code}, include_unresolved=True)
+    edge = _edge(edges, "draw", "render")
+    assert edge.resolution == "unresolved"
+    assert edge.resolved is False
+    assert edge.callee_file is None
+
+
+def test_obj_method_reassigned_receiver_stays_unresolved(
+    builder: CallGraphBuilder,
+) -> None:
+    """A receiver reassigned to an untyped value is left unresolved (sound)."""
+    code = (
+        "class Widget:\n"
+        "    def render(self):\n"
+        "        return 1\n"
+        "\n"
+        "def draw():\n"
+        "    w = Widget()\n"
+        "    w = fetch()\n"
+        "    return w.render()\n"
+    )
+    edges = builder.build_from_sources({"m.py": code}, include_unresolved=True)
+    edge = _edge(edges, "draw", "render")
+    assert edge.resolution == "unresolved"
+
+
+def test_obj_method_ambiguous_name_resolves_by_type(
+    builder: CallGraphBuilder,
+) -> None:
+    """With two classes sharing a method name, the receiver's type disambiguates."""
     code = (
         "class A:\n"
         "    def render(self):\n"
@@ -192,14 +254,51 @@ def test_obj_method_ambiguous_stays_unresolved(builder: CallGraphBuilder) -> Non
         "    def render(self):\n"
         "        return 2\n"
         "\n"
-        "def draw(x):\n"
-        "    return x.render()\n"
+        "def draw():\n"
+        "    b = B()\n"
+        "    return b.render()\n"
     )
-    edges = builder.build_from_sources({"m.py": code}, include_unresolved=True)
-    edge = _edge(edges, "draw", "render")
-    assert edge.resolution == "unresolved"
-    assert edge.resolved is False
-    assert edge.callee_file is None
+    edges = builder.build_from_sources({"m.py": code})
+    edge = _edge(edges, "draw", "B.render")
+    assert edge.resolution == "inferred"
+    assert not any(e.callee == "A.render" for e in edges)
+
+
+def test_inherited_self_method_resolves_via_base(
+    builder: CallGraphBuilder,
+) -> None:
+    """``self.method()`` resolves to a method defined on a base class."""
+    code = (
+        "class Base:\n"
+        "    def shared(self):\n"
+        "        return 1\n"
+        "\n"
+        "class Derived(Base):\n"
+        "    def run(self):\n"
+        "        return self.shared()\n"
+    )
+    edges = builder.build_from_sources({"m.py": code})
+    edge = _edge(edges, "Derived.run", "Base.shared")
+    assert edge.call_type == "method"
+    assert edge.resolution == "local"
+
+
+def test_inferred_method_resolves_across_files(builder: CallGraphBuilder) -> None:
+    """A receiver typed via an imported class resolves the method cross-file."""
+    sources = {
+        "models.py": "class User:\n    def touch(self):\n        return 1\n",
+        "app.py": (
+            "from models import User\n"
+            "\n"
+            "def handle(u: User):\n"
+            "    return u.touch()\n"
+        ),
+    }
+    edges = builder.build_from_sources(sources)
+    edge = _edge(edges, "handle", "User.touch")
+    assert edge.resolution == "inferred"
+    assert edge.call_type == "method"
+    assert edge.callee_file == "models.py"
 
 
 # ---------------------------------------------------------------------------
