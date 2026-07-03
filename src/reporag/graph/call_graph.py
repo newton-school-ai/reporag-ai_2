@@ -36,6 +36,9 @@ from pathlib import Path
 
 from tree_sitter import Node, Tree
 
+if typing.TYPE_CHECKING:
+    from src.reporag.ingestion.symbol_extractor import Symbol
+
 logger = logging.getLogger(__name__)
 
 
@@ -304,7 +307,7 @@ class _ScopeRange:
     end_line: int
 
 
-def _build_scope_ranges(symbols: list) -> list[_ScopeRange]:
+def _build_scope_ranges(symbols: list[Symbol]) -> list[_ScopeRange]:
     """Build one :class:`_ScopeRange` per function/method symbol."""
     ranges: list[_ScopeRange] = []
     for sym in symbols:
@@ -344,7 +347,7 @@ def _find_caller(
 # ---------------------------------------------------------------------------
 
 
-def _build_import_alias_map(symbols: list) -> dict[str, str]:
+def _build_import_alias_map(symbols: list[Symbol]) -> dict[str, str]:
     """Build ``{local_name: fully_qualified_name}`` from a file's import symbols.
 
     Rules
@@ -446,7 +449,7 @@ class CallGraphBuilder:
 
     def build(
         self,
-        symbols: list,
+        symbols: list[Symbol],
         file_asts: dict[str, Tree],
     ) -> CallGraph:
         """Build a :class:`CallGraph` from pre-extracted symbols and ASTs.
@@ -513,7 +516,7 @@ class CallGraphBuilder:
     # Legacy compat: build_from_symbols -> build
     def build_from_symbols(
         self,
-        symbols: list,
+        symbols: list[Symbol],
         file_asts: dict[str, Tree],
     ) -> list[CallEdge]:
         """Backward-compatible shim: returns a plain list of :class:`CallEdge`.
