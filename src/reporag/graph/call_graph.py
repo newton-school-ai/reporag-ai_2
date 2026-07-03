@@ -30,6 +30,7 @@ Public API
 from __future__ import annotations
 
 import logging
+import typing
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -43,7 +44,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(slots=True, frozen=True)
 class CallEdge:
     """A directed call edge from one symbol to another.
 
@@ -208,8 +209,10 @@ class CallGraph:
 def _decode(node: Node) -> str:
     """Safely decode a tree-sitter node's bytes to UTF-8 str."""
     raw = node.text
-    if raw is None:
+    if not raw:
         return ""
+    if isinstance(raw, str):
+        return raw
     return raw.decode("utf-8", errors="replace")
 
 
@@ -272,20 +275,18 @@ def _walk_attribute(node: Node) -> str:
     return ".".join(parts)
 
 
-def _collect_call_nodes(tree: Tree) -> list[Node]:
-    """Return every ``call`` AST node via iterative DFS.
+def _collect_call_nodes(tree: Tree) -> typing.Iterator[Node]:
+    """Yield every ``call`` AST node via iterative DFS.
 
     Always recurses into all children so nested calls like ``f(g())``
     are both captured.
     """
-    result: list[Node] = []
     stack: list[Node] = [tree.root_node]
     while stack:
         node = stack.pop()
         if node.type == "call":
-            result.append(node)
+            yield node
         stack.extend(reversed(node.children))
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +294,7 @@ def _collect_call_nodes(tree: Tree) -> list[Node]:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, frozen=True)
 class _ScopeRange:
     """Line span of a function or method symbol inside one file."""
 
