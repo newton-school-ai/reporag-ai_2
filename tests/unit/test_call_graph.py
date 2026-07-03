@@ -405,3 +405,8 @@ class TestBuildImportAliasMap:
         syms = self._import_syms("from os import *\n")
         m = _build_import_alias_map(syms)
         assert "*" not in m
+
+    def test_pure_relative_import(self) -> None:
+        syms = self._import_syms("from . import utils\n")
+        m = _build_import_alias_map(syms)
+        assert m["utils"] == ".utils"

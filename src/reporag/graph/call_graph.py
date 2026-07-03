@@ -373,7 +373,8 @@ def _build_import_alias_map(symbols: list) -> dict[str, str]:
             # ``import os`` -> source == "os", local == "os"  (same -> just map)
             # ``from math import sin`` -> source == "math", local == "sin"
             if source and local_name != source:
-                alias_map[local_name] = f"{source}.{local_name}"
+                sep = "" if source.endswith(".") else "."
+                alias_map[local_name] = f"{source}{sep}{local_name}"
             else:
                 alias_map[local_name] = local_name or source
     return alias_map
