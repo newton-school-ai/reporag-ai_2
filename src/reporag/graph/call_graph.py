@@ -321,9 +321,8 @@ def _build_scope_ranges(symbols: list) -> list[_ScopeRange]:
 
 
 def _find_caller(
-    file_path: str,
     line: int,
-    scope_ranges: list[_ScopeRange],
+    file_scope_ranges: list[_ScopeRange],
 ) -> str | None:
     """Return the innermost enclosing function's qualified name at *line*.
 
@@ -332,9 +331,7 @@ def _find_caller(
     scoping rules.  Returns ``None`` for module-level calls.
     """
     candidates = [
-        sr
-        for sr in scope_ranges
-        if sr.file_path == file_path and sr.start_line <= line <= sr.end_line
+        sr for sr in file_scope_ranges if sr.start_line <= line <= sr.end_line
     ]
     if not candidates:
         return None
@@ -490,6 +487,11 @@ class CallGraphBuilder:
 
         scope_ranges = _build_scope_ranges(symbols)
 
+        # Group scope ranges by file for O(1) file lookup during call resolution
+        scopes_by_file: dict[str, list[_ScopeRange]] = {}
+        for sr in scope_ranges:
+            scopes_by_file.setdefault(sr.file_path, []).append(sr)
+
         # Group import symbols by file for per-file alias resolution
         imports_by_file: dict[str, list] = {}
         for sym in symbols:
@@ -498,8 +500,9 @@ class CallGraphBuilder:
 
         for file_path, tree in file_asts.items():
             alias_map = _build_import_alias_map(imports_by_file.get(file_path, []))
+            file_scopes = scopes_by_file.get(file_path, [])
             for call_node in _collect_call_nodes(tree):
-                edge = self._make_edge(call_node, file_path, scope_ranges, alias_map)
+                edge = self._make_edge(call_node, file_path, file_scopes, alias_map)
                 if edge is not None:
                     graph.add_edge(edge)
 
@@ -621,7 +624,7 @@ class CallGraphBuilder:
         self,
         call_node: Node,
         file_path: str,
-        scope_ranges: list[_ScopeRange],
+        file_scopes: list[_ScopeRange],
         alias_map: dict[str, str],
     ) -> CallEdge | None:
         """Attempt to convert a ``call`` AST node into a :class:`CallEdge`.
@@ -636,7 +639,7 @@ class CallGraphBuilder:
 
         call_line = call_node.start_point[0] + 1  # convert to 1-based
 
-        caller = _find_caller(file_path, call_line, scope_ranges)
+        caller = _find_caller(call_line, file_scopes)
         if caller is None:
             return None  # module-level call -- skip
 
