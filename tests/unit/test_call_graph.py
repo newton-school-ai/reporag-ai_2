@@ -182,3 +182,53 @@ def test_chained_method_calls(builder: CallGraphBuilder) -> None:
 
     build_call = next(e for e in run_edges if e.callee == "Builder.build")
     assert build_call.line == 9
+
+
+def test_global_fallback_rejects_unimported_module(builder: CallGraphBuilder) -> None:
+    """Method on an object is NOT resolved to a definition in an unimported module.
+
+    Previously, if there was exactly one global candidate with the right method
+    name, it was returned regardless of whether the defining module was reachable
+    from the call site. This caused false edges.  The fix: only return a candidate
+    when its defining module is explicitly imported (or defined in the same file).
+    """
+    sources = {
+        # Defines Processor.process - but app.py never imports this file.
+        "workers.py": (
+            "class Processor:\n" "    def process(self):\n" "        pass\n"
+        ),
+        # Calls obj.process() on some opaque object without importing workers.py.
+        "app.py": ("def run(obj):\n" "    obj.process()\n"),
+    }
+    edges = builder.build_from_sources(sources)
+    app_edges = [e for e in edges if e.file_path == "app.py"]
+    assert len(app_edges) == 1
+    edge = app_edges[0]
+    # Should NOT resolve to "Processor.process" - that would be a false edge.
+    # The raw call-site text is the honest fallback.
+    assert edge.callee != "Processor.process"
+    assert edge.caller == "run"
+
+
+def test_global_fallback_matches_via_import_source(builder: CallGraphBuilder) -> None:
+    """Method is resolved when its module is reachable via a from-import.
+
+    ``from engine import Motor`` stores 'Motor' as the import *key* and
+    'engine' as the ``import_source``.  The resolver must check import_source
+    values (not just keys) to correctly match ``Motor.run`` to the ``m.run()``
+    call, which is a different code-path from a plain ``import engine`` statement.
+    """
+    sources = {
+        "engine.py": ("class Motor:\n" "    def run(self):\n" "        pass\n"),
+        "car.py": (
+            "from engine import Motor\n"
+            "def drive():\n"
+            "    m = Motor()\n"
+            "    m.run()\n"
+        ),
+    }
+    edges = builder.build_from_sources(sources)
+    car_edges = [e for e in edges if e.file_path == "car.py"]
+    run_edge = next(e for e in car_edges if "run" in str(e.callee))
+    assert run_edge.callee == "Motor.run"
+    assert run_edge.caller == "drive"

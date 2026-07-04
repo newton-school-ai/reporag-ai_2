@@ -529,26 +529,55 @@ class CallGraphBuilder:
         file_context: FileContext,
         contexts: dict[str, FileContext],
     ) -> str | None:
-        """Fallback lookup to match method calls to a candidate definition globally."""
+        """Fallback lookup to match method calls to a candidate definition globally.
+
+        Only returns a result when the candidate is unambiguously reachable:
+
+        - it is defined in the **same file** as the caller, OR
+        - its defining module is **explicitly imported** in the calling file
+          (checked against both the local import name key *and* the
+          ``import_source`` module path, to handle ``from pkg import Cls``
+          style imports where the key is ``Cls`` but the source is ``pkg``).
+
+        The former "unique global match" heuristic is intentionally removed:
+        a lone definition with the right name in an unrelated, unimported
+        module is still a false edge and degrades retrieval precision.
+        """
         candidates = self.global_methods.get(method_name)
         if not candidates:
             return None
 
-        # Prefer method candidates defined in the same file
+        # 1. Prefer method candidates defined in the same file
         same_file = [
             q for q, ctx in candidates if ctx.file_path == file_context.file_path
         ]
         if same_file:
             return same_file[0]
 
-        # Prefer candidates whose module is imported in this file
+        # 2. Prefer candidates whose defining module is explicitly imported.
+        # Build a set of all module paths that the calling file imports,
+        # covering both ``import mod`` (key) and ``from mod import X``
+        # (import_source) forms.
+        imported_modules: set[str] = set(file_context.imports.keys())
+        for sym in file_context.imports.values():
+            if sym.import_source:
+                # For ``from pkg.mod import X``, import_source is "pkg.mod";
+                # also add every prefix so submodule checks work.
+                parts = sym.import_source.split(".")
+                for i in range(1, len(parts) + 1):
+                    imported_modules.add(".".join(parts[:i]))
+
         for q, ctx in candidates:
             for mod in _get_possible_module_names(ctx.file_path):
-                if mod in file_context.imports:
+                if mod in imported_modules:
                     return q
 
-        # Fallback to unique matches
-        if len(candidates) == 1:
-            return candidates[0][0]
-
+        # 3. No confident match -- log and return None to avoid a false edge.
+        logger.debug(
+            "Could not confidently resolve method %r to a callee "
+            "(%d global candidate(s) found, none reachable via imports); "
+            "falling back to raw call-site text.",
+            method_name,
+            len(candidates),
+        )
         return None
