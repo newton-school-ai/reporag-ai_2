@@ -59,11 +59,12 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Literal
 
 from tree_sitter import Node, Tree
 
+from src.reporag.graph._modules import ModuleIndex
 from src.reporag.ingestion.parser import ASTParser
 from src.reporag.ingestion.symbol_extractor import Symbol, SymbolExtractor
 
@@ -210,88 +211,6 @@ class _RawCall:
 
 
 # ---------------------------------------------------------------------------
-# Module index: dotted module name <-> file path resolution
-# ---------------------------------------------------------------------------
-
-
-class _ModuleIndex:
-    """Resolves import module names to project file paths.
-
-    - **Why it exists**: Cross-file call resolution hinges on mapping an import
-      like ``from db import get_user`` (module ``"db"``) to the file that
-      defines ``db`` -- here ``examples/sample_repo/db.py``.
-    - **Algorithm**: For every file it precomputes all dotted *suffixes* of the
-      path (``examples.sample_repo.db``, ``sample_repo.db``, ``db``) and maps
-      each to the file.  A bare ``import db`` matches the shortest suffix; a
-      fully qualified ``import examples.sample_repo.db`` matches the longest.
-    - **Edge cases**: ``__init__.py`` collapses to its package directory so a
-      package import resolves to the package.  Relative imports (``.``, ``..``)
-      are rebuilt into an absolute dotted path against the importing file.
-    - **Correctness choice**: Uses POSIX path semantics regardless of host OS so
-      module names are stable across platforms.
-    """
-
-    def __init__(self, files: Iterable[str]) -> None:
-        """Build the suffix map from the set of project *files*."""
-        self._suffix_map: dict[str, list[str]] = {}
-        for file_path in files:
-            for candidate in self._module_candidates(file_path):
-                bucket = self._suffix_map.setdefault(candidate, [])
-                if file_path not in bucket:
-                    bucket.append(file_path)
-
-    @staticmethod
-    def _parts(file_path: str) -> list[str]:
-        """Return the dotted-module path components for *file_path*.
-
-        Strips the file extension and folds ``__init__`` into its package
-        directory (``pkg/__init__.py`` -> ``["pkg"]``).
-        """
-        pure = PurePosixPath(file_path.replace("\\", "/"))
-        parts = list(pure.parts[:-1]) + [pure.stem]
-        if pure.stem == "__init__":
-            parts = parts[:-1]
-        return [p for p in parts if p not in ("", ".", "/")]
-
-    def _module_candidates(self, file_path: str) -> list[str]:
-        """Return every dotted suffix of *file_path*'s module path."""
-        parts = self._parts(file_path)
-        return [".".join(parts[i:]) for i in range(len(parts)) if parts[i:]]
-
-    def resolve_absolute(self, module: str) -> list[str]:
-        """Return files matching an absolute dotted *module* name."""
-        return list(self._suffix_map.get(module, []))
-
-    def resolve_relative(self, module: str, importing_file: str) -> list[str]:
-        """Resolve a relative import (``.``, ``..pkg``) to project files.
-
-        - **Algorithm**: Counts leading dots to find how many package levels to
-          ascend from *importing_file*'s package, appends the remaining dotted
-          remainder, then looks the rebuilt absolute name up in the suffix map.
-        - **Edge cases**: A bare ``from . import x`` (empty remainder) resolves
-          to the importing file's own package directory.
-        """
-        level = len(module) - len(module.lstrip("."))
-        remainder = module[level:]
-
-        base = self._parts(importing_file)[:-1]  # importing module's package
-        ascend = level - 1  # a single dot means "this package"
-        if ascend > 0:
-            base = base[:-ascend] if ascend <= len(base) else []
-
-        target = base + (remainder.split(".") if remainder else [])
-        if not target:
-            return []
-        return self.resolve_absolute(".".join(target))
-
-    def resolve(self, module: str, importing_file: str) -> list[str]:
-        """Resolve *module* (absolute or relative) to candidate files."""
-        if module.startswith("."):
-            return self.resolve_relative(module, importing_file)
-        return self.resolve_absolute(module)
-
-
-# ---------------------------------------------------------------------------
 # Enclosing-symbol index: which definition owns a given line
 # ---------------------------------------------------------------------------
 
@@ -373,7 +292,7 @@ class _ResolutionContext:
 
     def __init__(self, symbols_by_file: Mapping[str, list[Symbol]]) -> None:
         """Index all symbols across the repository."""
-        self.module_index = _ModuleIndex(symbols_by_file.keys())
+        self.module_index = ModuleIndex(symbols_by_file.keys())
 
         # file -> {name -> module-level def/class Symbol}
         self._module_level: dict[str, dict[str, Symbol]] = {}
