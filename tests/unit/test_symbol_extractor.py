@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from src.reporag.ingestion.parser import UnsupportedLanguageError
-from src.reporag.ingestion.symbol_extractor import SymbolExtractor
+from reporag.ingestion.parser import UnsupportedLanguageError
+from reporag.ingestion.symbol_extractor import SymbolExtractor
 
 
 @pytest.fixture

@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from src.reporag.config import settings
-from src.reporag.ingestion.cloner import CloneError, FileEntry, RepoCloner
+from reporag.config import settings
+from reporag.ingestion.cloner import CloneError, FileEntry, RepoCloner
 
 
 @pytest.fixture

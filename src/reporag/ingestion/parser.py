@@ -22,7 +22,7 @@ from pathlib import Path
 
 from tree_sitter import Language, Node, Parser, Tree
 
-from src.reporag.config import settings
+from reporag.config import settings
 
 logger = logging.getLogger(__name__)
 

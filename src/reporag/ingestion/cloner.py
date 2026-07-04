@@ -14,7 +14,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from src.reporag.config import settings
+from reporag.config import settings
 
 logger = logging.getLogger(__name__)
 

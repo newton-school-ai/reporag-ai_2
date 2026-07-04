@@ -16,8 +16,8 @@ import pathlib
 
 import pytest
 
-from src.reporag.ingestion.chunker import Chunk, SemanticChunker, count_tokens
-from src.reporag.ingestion.parser import UnsupportedLanguageError
+from reporag.ingestion.chunker import Chunk, SemanticChunker, count_tokens
+from reporag.ingestion.parser import UnsupportedLanguageError
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -453,7 +453,7 @@ def test_chunk_file_infers_language_from_extension(
 
 def test_chunk_from_tree_same_as_chunk_source(chunker: SemanticChunker) -> None:
     """chunk_from_tree and chunk_source produce identical results."""
-    from src.reporag.ingestion.parser import ASTParser
+    from reporag.ingestion.parser import ASTParser
 
     src = "class Greeter:\n    def greet(self) -> str:\n        return 'hello'\n"
     tree = ASTParser().parse(src.encode(), language="python")
@@ -485,14 +485,14 @@ def test_unsupported_language_raises(chunker: SemanticChunker) -> None:
 
 def test_chunk_exported_from_ingestion_package() -> None:
     """Chunk is re-exported from the ingestion package __init__."""
-    from src.reporag.ingestion import Chunk as ChunkAlias
+    from reporag.ingestion import Chunk as ChunkAlias
 
     assert ChunkAlias is Chunk
 
 
 def test_semantic_chunker_exported_from_ingestion_package() -> None:
     """SemanticChunker is re-exported from the ingestion package __init__."""
-    from src.reporag.ingestion import SemanticChunker as SCAlias
+    from reporag.ingestion import SemanticChunker as SCAlias
 
     assert SCAlias is SemanticChunker
 

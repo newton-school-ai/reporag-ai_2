@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from src.reporag.ingestion.parser import (
+from reporag.ingestion.parser import (
     ASTNode,
     ASTParser,
     ParseError,

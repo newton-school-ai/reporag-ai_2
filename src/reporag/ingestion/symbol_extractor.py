@@ -13,7 +13,7 @@ from typing import Literal
 
 from tree_sitter import Node, Tree
 
-from src.reporag.ingestion.parser import ASTParser, UnsupportedLanguageError
+from reporag.ingestion.parser import ASTParser, UnsupportedLanguageError
 
 SymbolType = Literal["class", "function", "method", "import"]
 
@@ -572,7 +572,7 @@ class SymbolExtractor:
         fpath = Path(file_path)
 
         if language is None:
-            from src.reporag.config import settings
+            from reporag.config import settings
 
             ext = fpath.suffix.lower()
             language = settings.extension_map.get(ext)
@@ -582,7 +582,7 @@ class SymbolExtractor:
                 )
 
         # Prevent reading the file twice: read the bytes once
-        from src.reporag.ingestion.parser import ParseError
+        from reporag.ingestion.parser import ParseError
 
         try:
             source_bytes = fpath.read_bytes()

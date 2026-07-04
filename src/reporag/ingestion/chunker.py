@@ -10,7 +10,7 @@ is_continuation, overlap_header.
 
 Usage::
 
-    from src.reporag.ingestion.chunker import SemanticChunker
+    from reporag.ingestion.chunker import SemanticChunker
 
     chunker = SemanticChunker(max_tokens=512)
     chunks = chunker.chunk_file('examples/sample_repo/app.py')
@@ -32,7 +32,7 @@ from typing import Literal
 import tiktoken
 from tree_sitter import Node, Tree
 
-from src.reporag.ingestion.parser import ASTParser, UnsupportedLanguageError
+from reporag.ingestion.parser import ASTParser, UnsupportedLanguageError
 
 logger = logging.getLogger(__name__)
 
@@ -817,12 +817,12 @@ class SemanticChunker:
                 has no registered chunker.
             ParseError: If the file cannot be read.
         """
-        from src.reporag.ingestion.parser import ParseError
+        from reporag.ingestion.parser import ParseError
 
         fpath = Path(file_path)
 
         if language is None:
-            from src.reporag.config import settings
+            from reporag.config import settings
 
             ext = fpath.suffix.lower()
             language = settings.extension_map.get(ext)
