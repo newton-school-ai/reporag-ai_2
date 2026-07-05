@@ -55,9 +55,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from src.reporag.graph.call_graph import _ModuleIndex
-from src.reporag.ingestion.parser import ASTParser
-from src.reporag.ingestion.symbol_extractor import Symbol, SymbolExtractor
+from ..graph.call_graph import _ModuleIndex
+from ..ingestion.parser import ASTParser
+from ..ingestion.symbol_extractor import Symbol, SymbolExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -588,7 +588,7 @@ class DependencyGraphBuilder:
     @staticmethod
     def _infer_language(path: Path) -> str | None:
         """Infer a language from a file extension via ``settings.extension_map``."""
-        from src.reporag.config import settings
+        from ..config import settings
 
         return settings.extension_map.get(path.suffix.lower())
 

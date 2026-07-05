@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.reporag.graph.dependency_graph import (
+from reporag.graph.dependency_graph import (
     DependencyEdge,
     DependencyGraphBuilder,
 )
@@ -253,8 +253,8 @@ def test_build_from_files(builder: DependencyGraphBuilder) -> None:
 
 def test_build_from_symbols_api(builder: DependencyGraphBuilder) -> None:
     """The lower-level build_from_symbols API works."""
-    from src.reporag.ingestion.parser import ASTParser
-    from src.reporag.ingestion.symbol_extractor import SymbolExtractor
+    from reporag.ingestion.parser import ASTParser
+    from reporag.ingestion.symbol_extractor import SymbolExtractor
 
     parser = ASTParser()
     extractor = SymbolExtractor(parser)
@@ -341,7 +341,7 @@ def test_build_from_files_errors(builder: DependencyGraphBuilder) -> None:
 
 def test_module_key_none(builder: DependencyGraphBuilder) -> None:
     """Test symbols with no import source are skipped."""
-    from src.reporag.ingestion.symbol_extractor import Symbol
+    from reporag.ingestion.symbol_extractor import Symbol
 
     sym = Symbol(name="x", type="import", file_path="a.py", start_line=1, end_line=1)
     edges = builder.build_from_symbols([sym])
