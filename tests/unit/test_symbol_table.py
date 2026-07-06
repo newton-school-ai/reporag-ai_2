@@ -248,3 +248,30 @@ def test_json_serialization_deserialization() -> None:
     assert record.signature == "def process_data(data)"
     assert record.docstring == "Process incoming data."
     assert record.qualified_name == "src.processor.process_data"
+
+
+def test_import_symbol_details() -> None:
+    """Import symbols register with complete detailed metadata (source, alias, wildcard)."""
+    table = SymbolTable()
+
+    sym = Symbol(
+        name="Flask",
+        type="import",
+        file_path="src/app.py",
+        start_line=2,
+        end_line=2,
+        import_source="flask",
+        import_alias="F",
+        is_wildcard_import=False,
+    )
+
+    table.register_symbols([sym])
+
+    results = table.lookup("Flask")
+    assert len(results) == 1
+    record = results[0]
+    assert record.type == "import"
+    assert record.import_source == "flask"
+    assert record.import_alias == "F"
+    assert record.is_wildcard_import is False
+

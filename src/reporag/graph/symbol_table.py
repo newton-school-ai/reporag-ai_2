@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +35,12 @@ class SymbolRecord:
     docstring: str | None
     name: str
     qualified_name: str
+    is_async: bool = False
+    decorators: list[str] = field(default_factory=list)
+    bases: list[str] = field(default_factory=list)
+    import_source: str | None = None
+    import_alias: str | None = None
+    is_wildcard_import: bool = False
 
 
 class SymbolTable:
@@ -116,6 +122,13 @@ class SymbolTable:
                 else getattr(sym, "qualified_name", None)
             )
 
+            is_async = sym.get("is_async") if is_dict else getattr(sym, "is_async", False)
+            decorators = sym.get("decorators") if is_dict else getattr(sym, "decorators", [])
+            bases = sym.get("bases") if is_dict else getattr(sym, "bases", [])
+            import_source = sym.get("import_source") if is_dict else getattr(sym, "import_source", None)
+            import_alias = sym.get("import_alias") if is_dict else getattr(sym, "import_alias", None)
+            is_wildcard_import = sym.get("is_wildcard_import") if is_dict else getattr(sym, "is_wildcard_import", False)
+
             if not name:
                 return
 
@@ -141,6 +154,12 @@ class SymbolTable:
                 docstring=docstring,
                 name=name,
                 qualified_name=fully_qualified,
+                is_async=bool(is_async),
+                decorators=list(decorators),
+                bases=list(bases),
+                import_source=import_source,
+                import_alias=import_alias,
+                is_wildcard_import=bool(is_wildcard_import),
             )
             self.registry[symbol_id] = record
 
