@@ -66,13 +66,16 @@ class SymbolTable:
         self._fuzzy_cache: dict[tuple[str, int], list[SymbolRecord]] = {}
 
     def __len__(self) -> int:
-        return len(self._registry)
+        with self._lock:
+            return len(self._registry)
 
     def __iter__(self) -> Iterator[SymbolRecord]:
-        return iter(self._registry.values())
+        with self._lock:
+            return iter(list(self._registry.values()))
 
     def __contains__(self, item: str) -> bool:
-        return item in self._name_index or item in self._qualified_name_index
+        with self._lock:
+            return item in self._name_index or item in self._qualified_name_index
 
     def clear(self) -> None:
         """Safely clear the entire registry and all indices."""
@@ -320,16 +323,20 @@ class SymbolTable:
 
     def lookup_by_file_pattern(self, glob_pattern: str) -> list[SymbolRecord]:
         """Lookup symbols across files matching a glob pattern."""
-        results = []
-        for file_path, sids in self._file_index.items():
-            if fnmatch.fnmatch(file_path, glob_pattern):
-                for sid in sids:
-                    results.append(self._registry[sid])
-        return results
+        with self._lock:
+            results = []
+            for file_path, sids in self._file_index.items():
+                if fnmatch.fnmatch(file_path, glob_pattern):
+                    for sid in sids:
+                        results.append(self._registry[sid])
+            return results
 
     def lookup_by_type(self, symbol_type: str) -> list[SymbolRecord]:
         """Lookup all symbols of a specific type (e.g. 'class', 'function')."""
-        return [self._registry[sid] for sid in self._type_index.get(symbol_type, {})]
+        with self._lock:
+            return [
+                self._registry[sid] for sid in self._type_index.get(symbol_type, {})
+            ]
 
     def lookup_by_position(
         self, file_path: str, line_number: int
@@ -363,33 +370,41 @@ class SymbolTable:
         self, file_path: str, line_number: int
     ) -> list[SymbolRecord]:
         """Return the stack of symbols enclosing the position, from outermost to innermost."""
-        innermost = self.lookup_by_position(file_path, line_number)
-        if not innermost:
-            return []
+        with self._lock:
+            innermost = self.lookup_by_position(file_path, line_number)
+            if not innermost:
+                return []
 
-        hierarchy = []
-        current = innermost
-        while current:
-            hierarchy.insert(0, current)
-            current = self.get_parent(current.symbol_id) if current.parent_id else None
+            hierarchy = []
+            current = innermost
+            while current:
+                hierarchy.insert(0, current)
+                current = (
+                    self.get_parent(current.symbol_id) if current.parent_id else None
+                )
 
-        return hierarchy
+            return hierarchy
 
     def get_parent(self, symbol_id: str) -> SymbolRecord | None:
         """Retrieve the parent symbol of a given symbol_id."""
-        record = self._registry.get(symbol_id)
-        if record and record.parent_id:
-            return self._registry.get(record.parent_id)
-        return None
+        with self._lock:
+            record = self._registry.get(symbol_id)
+            if record and record.parent_id:
+                return self._registry.get(record.parent_id)
+            return None
 
     def get_children(self, symbol_id: str) -> list[SymbolRecord]:
         """Retrieve all immediate children of a given symbol_id."""
-        return [self._registry[sid] for sid in self._children_index.get(symbol_id, {})]
+        with self._lock:
+            return [
+                self._registry[sid] for sid in self._children_index.get(symbol_id, {})
+            ]
 
     def to_json(self) -> str:
         """Serialize the symbol table to JSON."""
-        data = {sid: record.to_dict() for sid, record in self._registry.items()}
-        return json.dumps(data)
+        with self._lock:
+            data = {sid: record.to_dict() for sid, record in self._registry.items()}
+            return json.dumps(data)
 
     @classmethod
     def from_json(cls, json_str: str) -> SymbolTable:
