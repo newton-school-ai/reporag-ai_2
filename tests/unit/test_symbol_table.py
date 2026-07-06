@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 
-from src.reporag.graph.symbol_table import SymbolTable
-from src.reporag.ingestion.symbol_extractor import Symbol
+from reporag.graph.symbol_table import SymbolTable
+from reporag.ingestion.symbol_extractor import Symbol
 
 
 def test_symbol_table_initialization() -> None:
