@@ -7,11 +7,13 @@ qualified name, regex pattern, and file path.
 
 from __future__ import annotations
 
+import bisect
 import difflib
 import fnmatch
 import hashlib
 import json
 import re
+import threading
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import PurePosixPath
@@ -50,12 +52,18 @@ class SymbolTable:
 
     def __init__(self) -> None:
         """Initialise an empty symbol table."""
+        self._lock = threading.RLock()
         self._registry: dict[str, SymbolRecord] = {}
         self._name_index: dict[str, set[str]] = {}
         self._qualified_name_index: dict[str, set[str]] = {}
         self._file_index: dict[str, set[str]] = {}
         self._type_index: dict[str, set[str]] = {}
         self._children_index: dict[str, set[str]] = {}
+        self._file_intervals: dict[str, list[tuple[int, int, str]]] = {}
+
+        # Caches for expensive queries
+        self._regex_cache: dict[str, list[SymbolRecord]] = {}
+        self._fuzzy_cache: dict[tuple[str, int], list[SymbolRecord]] = {}
 
     def __len__(self) -> int:
         return len(self._registry)
@@ -68,12 +76,16 @@ class SymbolTable:
 
     def clear(self) -> None:
         """Safely clear the entire registry and all indices."""
-        self._registry.clear()
-        self._name_index.clear()
-        self._qualified_name_index.clear()
-        self._file_index.clear()
-        self._type_index.clear()
-        self._children_index.clear()
+        with self._lock:
+            self._registry.clear()
+            self._name_index.clear()
+            self._qualified_name_index.clear()
+            self._file_index.clear()
+            self._type_index.clear()
+            self._children_index.clear()
+            self._file_intervals.clear()
+            self._regex_cache.clear()
+            self._fuzzy_cache.clear()
 
     def _remove_sids_from_index(
         self, index: dict[str, set[str]], keys: Iterable[str], sids_to_remove: set[str]
@@ -87,9 +99,10 @@ class SymbolTable:
 
     def remove_by_file(self, file_path: str) -> None:
         """Remove all symbols associated with a specific file path."""
-        sids_to_remove = self._file_index.pop(file_path, None)
-        if not sids_to_remove:
-            return
+        with self._lock:
+            sids_to_remove = self._file_index.pop(file_path, None)
+            if not sids_to_remove:
+                return
 
         affected_names = set()
         affected_qnames = set()
@@ -117,6 +130,9 @@ class SymbolTable:
         self._remove_sids_from_index(
             self._children_index, affected_parents, sids_to_remove
         )
+        self._file_intervals.pop(file_path, None)
+        self._regex_cache.clear()
+        self._fuzzy_cache.clear()
 
     def update_file(self, file_path: str, symbols: Iterable[Symbol]) -> None:
         """Replace all symbols for a specific file with a new set of symbols."""
@@ -209,9 +225,24 @@ class SymbolTable:
 
     def register_symbols(self, symbols: Iterable[Symbol]) -> None:
         """Register a list of root symbols and their children recursively."""
-        for symbol in symbols:
-            module_name = self._infer_module_name(symbol.file_path)
-            self._flatten_and_register(symbol, module_name)
+        with self._lock:
+            modified_files = set()
+            for symbol in symbols:
+                module_name = self._infer_module_name(symbol.file_path)
+                self._flatten_and_register(symbol, module_name)
+                modified_files.add(symbol.file_path)
+
+            # Rebuild O(log N) positional intervals for modified files
+            for file_path in modified_files:
+                intervals = [
+                    (r.start_line, r.end_line, r.symbol_id)
+                    for r in self.lookup_by_file(file_path)
+                ]
+                intervals.sort(key=lambda x: x[0])
+                self._file_intervals[file_path] = intervals
+
+            self._regex_cache.clear()
+            self._fuzzy_cache.clear()
 
     def get_by_id(self, symbol_id: str) -> SymbolRecord | None:
         """Retrieve a symbol directly by its unique ID."""
@@ -219,54 +250,73 @@ class SymbolTable:
 
     def lookup(self, name: str) -> list[SymbolRecord]:
         """Lookup symbols by exact name (e.g. 'authenticate')."""
-        return [self._registry[sid] for sid in self._name_index.get(name, {})]
+        with self._lock:
+            return [self._registry[sid] for sid in self._name_index.get(name, {})]
 
     def lookup_by_qualified_name(self, qualified_name: str) -> list[SymbolRecord]:
         """Lookup symbols by fully qualified name (returns unique match per file)."""
-        return [
-            self._registry[sid]
-            for sid in self._qualified_name_index.get(qualified_name, {})
-        ]
+        with self._lock:
+            return [
+                self._registry[sid]
+                for sid in self._qualified_name_index.get(qualified_name, {})
+            ]
 
     def lookup_by_regex(self, pattern: str) -> list[SymbolRecord]:
         """Lookup symbols using a regex pattern against the fully qualified name or name."""
-        try:
-            regex = re.compile(pattern)
-        except re.error as e:
-            raise ValueError(f"Invalid regex pattern: '{pattern}'") from e
+        with self._lock:
+            if pattern in self._regex_cache:
+                return list(self._regex_cache[pattern])
 
-        return [
-            record
-            for record in self._registry.values()
-            if regex.search(record.name) or regex.search(record.qualified_name)
-        ]
+            try:
+                regex = re.compile(pattern)
+            except re.error as e:
+                raise ValueError(f"Invalid regex pattern: '{pattern}'") from e
+
+            results = [
+                record
+                for record in self._registry.values()
+                if regex.search(record.name) or regex.search(record.qualified_name)
+            ]
+            self._regex_cache[pattern] = results
+            return list(results)
 
     def lookup_fuzzy(self, query: str, limit: int = 3) -> list[SymbolRecord]:
         """Fuzzy search for typo-tolerant matching against symbol names."""
-        # Fallback to fast substring matching first to save heavy difflib CPU cycles
-        query_lower = query.lower()
-        exact_substring_matches = [
-            name for name in self._name_index if query_lower in name.lower()
-        ]
+        with self._lock:
+            cache_key = (query, limit)
+            if cache_key in self._fuzzy_cache:
+                return list(self._fuzzy_cache[cache_key])
 
-        # Only use difflib on the filtered subset if possible, else full keys
-        search_space = (
-            exact_substring_matches
-            if exact_substring_matches
-            else self._name_index.keys()
-        )
+            # Fallback to fast substring matching first to save heavy difflib CPU cycles
+            query_lower = query.lower()
+            exact_substring_matches = [
+                name for name in self._name_index if query_lower in name.lower()
+            ]
 
-        matches = difflib.get_close_matches(query, search_space, n=limit, cutoff=0.6)
+            # Only use difflib on the filtered subset if possible, else full keys
+            search_space = (
+                exact_substring_matches
+                if exact_substring_matches
+                else self._name_index.keys()
+            )
 
-        results = []
-        for match in matches:
-            results.extend(self.lookup(match))
+            matches = difflib.get_close_matches(
+                query, search_space, n=limit, cutoff=0.6
+            )
 
-        return results[:limit]
+            results = []
+            for match in matches:
+                # Extend matches from exact lookup
+                results.extend(self.lookup(match))
+
+            final_results = results[:limit]
+            self._fuzzy_cache[cache_key] = final_results
+            return list(final_results)
 
     def lookup_by_file(self, file_path: str) -> list[SymbolRecord]:
         """Lookup all symbols defined in a specific file."""
-        return [self._registry[sid] for sid in self._file_index.get(file_path, {})]
+        with self._lock:
+            return [self._registry[sid] for sid in self._file_index.get(file_path, {})]
 
     def lookup_by_file_pattern(self, glob_pattern: str) -> list[SymbolRecord]:
         """Lookup symbols across files matching a glob pattern."""
@@ -285,18 +335,28 @@ class SymbolTable:
         self, file_path: str, line_number: int
     ) -> SymbolRecord | None:
         """Find the innermost symbol that encloses the given line number in a file."""
-        # Generator for O(1) space complexity during large file lookups
-        candidates = (
-            record
-            for record in self.lookup_by_file(file_path)
-            if record.start_line <= line_number <= record.end_line
-        )
+        with self._lock:
+            intervals = self._file_intervals.get(file_path)
+            if not intervals:
+                return None
 
-        try:
-            # The innermost symbol will have the shortest length (end_line - start_line)
-            return min(candidates, key=lambda r: (r.end_line - r.start_line))
-        except ValueError:
-            # Raised by min() if candidates generator is empty
+            # O(log N) search for the right-most interval whose start_line <= line_number
+            idx = bisect.bisect_right(intervals, (line_number, float("inf"), ""))
+
+            best_match = None
+            min_length = float("inf")
+
+            # Walk backwards from insertion point to find the tightest wrapping interval
+            for i in range(idx - 1, -1, -1):
+                start, end, sid = intervals[i]
+                if start <= line_number <= end:
+                    length = end - start
+                    if length < min_length:
+                        min_length = length
+                        best_match = sid
+
+            if best_match:
+                return self._registry.get(best_match)
             return None
 
     def lookup_hierarchy_by_position(
