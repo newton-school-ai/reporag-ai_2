@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import pytest
 
-from reporag.graph.dependency_graph import (
+from src.reporag.graph.dependency_graph import (
     CircularImportChain,
     DependencyEdge,
     DependencyGraphBuilder,
     DependencyGraphResult,
 )
-from reporag.ingestion.symbol_extractor import SymbolExtractor
+from src.reporag.ingestion.symbol_extractor import SymbolExtractor
 
 
 @pytest.fixture
