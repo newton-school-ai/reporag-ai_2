@@ -1,406 +1,250 @@
-"""Unit tests for the SymbolTable."""
+"""Unit tests for the SymbolTable (Issue 11)."""
 
 from __future__ import annotations
 
-import pytest
+import json
 
 from src.reporag.graph.symbol_table import SymbolTable
 from src.reporag.ingestion.symbol_extractor import Symbol
 
 
-@pytest.fixture
-def empty_table() -> SymbolTable:
-    return SymbolTable()
+def test_symbol_table_initialization() -> None:
+    """An initialized SymbolTable is empty."""
+    table = SymbolTable()
+    assert len(table.registry) == 0
 
 
-def test_infer_module_name(empty_table: SymbolTable) -> None:
-    """Verify module names are inferred correctly from file paths."""
-    assert (
-        empty_table._infer_module_name("src/reporag/graph/symbol_table.py")
-        == "src.reporag.graph.symbol_table"
-    )
-    assert empty_table._infer_module_name("tests/unit/__init__.py") == "tests.unit"
-    assert empty_table._infer_module_name("my_script.py") == "my_script"
+def test_name_collision_across_files() -> None:
+    """Name collision across files resolves properly.
 
+    - Lookup by exact name returns all matches across files.
+    - Lookup by qualified name returns unique match.
+    """
+    table = SymbolTable()
 
-def test_register_symbols(empty_table: SymbolTable) -> None:
-    """Verify symbols and their nested children are flattened and registered."""
-    method = Symbol(
+    sym1 = Symbol(
         name="authenticate",
-        type="method",
-        file_path="auth.py",
+        type="function",
+        file_path="src/auth.py",
         start_line=10,
         end_line=20,
-        qualified_name="Auth.authenticate",
+        signature="def authenticate(username, password)",
+        docstring="Authenticate user.",
     )
-    cls = Symbol(
-        name="Auth",
-        type="class",
-        file_path="auth.py",
-        start_line=5,
+    sym2 = Symbol(
+        name="authenticate",
+        type="function",
+        file_path="src/api/v1/auth.py",
+        start_line=15,
         end_line=25,
-        methods=[method],
+        signature="def authenticate(token)",
+        docstring="Authenticate API token.",
     )
 
-    empty_table.register_symbols([cls])
+    table.register_symbols([sym1, sym2])
 
-    # Check that both cls and method are registered
-    assert len(empty_table) == 2
-
-    # Check fully qualified names are generated with the inferred module prefix
-    auth_cls = empty_table.lookup("Auth")[0]
-    auth_method = empty_table.lookup("authenticate")[0]
-
-    assert auth_cls.qualified_name == "auth.Auth"
-    assert auth_method.qualified_name == "auth.Auth.authenticate"
-
-
-def test_lookup_exact_name(empty_table: SymbolTable) -> None:
-    """Verify lookup by exact name returns all matches across files."""
-    sym1 = Symbol(
-        name="fetch", type="function", file_path="api.py", start_line=1, end_line=2
-    )
-    sym2 = Symbol(
-        name="fetch", type="function", file_path="db.py", start_line=1, end_line=2
-    )
-
-    empty_table.register_symbols([sym1, sym2])
-
-    results = empty_table.lookup("fetch")
+    # Lookup by exact name returns both matches
+    results = table.lookup("authenticate")
     assert len(results) == 2
-    assert {r.file_path for r in results} == {"api.py", "db.py"}
+    paths = {r.file_path for r in results}
+    assert paths == {"src/auth.py", "src/api/v1/auth.py"}
+
+    # Lookup by qualified name returns unique match
+    res1 = table.lookup("src.auth.authenticate")
+    assert len(res1) == 1
+    assert res1[0].file_path == "src/auth.py"
+
+    res2 = table.lookup("src.api.v1.auth.authenticate")
+    assert len(res2) == 1
+    assert res2[0].file_path == "src/api/v1/auth.py"
 
 
-def test_lookup_by_qualified_name(empty_table: SymbolTable) -> None:
-    """Verify lookup by fully qualified name returns the unique match."""
-    sym = Symbol(
-        name="fetch", type="function", file_path="src/api.py", start_line=1, end_line=2
-    )
-    empty_table.register_symbols([sym])
+def test_nested_class_methods() -> None:
+    """Nested class methods are registered and resolved using fully qualified names."""
+    table = SymbolTable()
 
-    results = empty_table.lookup_by_qualified_name("src.api.fetch")
-    assert len(results) == 1
-    assert results[0].name == "fetch"
-    assert results[0].qualified_name == "src.api.fetch"
-
-
-def test_lookup_by_regex(empty_table: SymbolTable) -> None:
-    """Verify regex lookup works properly on names or qualified names."""
-    sym1 = Symbol(
-        name="test_login",
-        type="function",
-        file_path="auth_tests.py",
-        start_line=1,
-        end_line=2,
-    )
-    sym2 = Symbol(
-        name="test_logout",
-        type="function",
-        file_path="auth_tests.py",
-        start_line=4,
-        end_line=5,
-    )
-    sym3 = Symbol(
-        name="helper",
-        type="function",
-        file_path="auth_tests.py",
-        start_line=7,
-        end_line=8,
-    )
-
-    empty_table.register_symbols([sym1, sym2, sym3])
-
-    results = empty_table.lookup_by_regex(r"^test_")
-    assert len(results) == 2
-    assert {r.name for r in results} == {"test_login", "test_logout"}
-
-
-def test_lookup_by_file(empty_table: SymbolTable) -> None:
-    """Verify we can fetch all symbols inside a specific file."""
-    sym1 = Symbol(
-        name="f1", type="function", file_path="a.py", start_line=1, end_line=2
-    )
-    sym2 = Symbol(
-        name="f2", type="function", file_path="a.py", start_line=3, end_line=4
-    )
-    sym3 = Symbol(
-        name="f3", type="function", file_path="b.py", start_line=1, end_line=2
-    )
-
-    empty_table.register_symbols([sym1, sym2, sym3])
-
-    results = empty_table.lookup_by_file("a.py")
-    assert len(results) == 2
-    assert {r.name for r in results} == {"f1", "f2"}
-
-
-def test_lookup_by_type(empty_table: SymbolTable) -> None:
-    """Verify we can fetch all symbols of a specific type."""
-    sym1 = Symbol(
-        name="f1", type="function", file_path="a.py", start_line=1, end_line=2
-    )
-    sym2 = Symbol(name="C1", type="class", file_path="a.py", start_line=3, end_line=4)
-    sym3 = Symbol(
-        name="f2", type="function", file_path="b.py", start_line=1, end_line=2
-    )
-
-    empty_table.register_symbols([sym1, sym2, sym3])
-
-    funcs = empty_table.lookup_by_type("function")
-    classes = empty_table.lookup_by_type("class")
-
-    assert len(funcs) == 2
-    assert len(classes) == 1
-    assert classes[0].name == "C1"
-
-
-def test_module_level_vars(empty_table: SymbolTable) -> None:
-    """Verify registration and lookup of module-level variables."""
-    sym = Symbol(
-        name="GLOBAL_TIMEOUT",
-        type="variable",
-        file_path="config.py",
-        start_line=10,
-        end_line=10,
-        docstring="The global timeout",
-    )
-    empty_table.register_symbols([sym])
-
-    results = empty_table.lookup("GLOBAL_TIMEOUT")
-    assert len(results) == 1
-    assert results[0].type == "variable"
-    assert results[0].qualified_name == "config.GLOBAL_TIMEOUT"
-
-
-def test_collection_protocols(empty_table: SymbolTable) -> None:
-    """Verify pythonic container behaviors like len(), in, and iter()."""
-    sym = Symbol(
-        name="fetch", type="function", file_path="api.py", start_line=1, end_line=2
-    )
-    empty_table.register_symbols([sym])
-
-    # __len__
-    assert len(empty_table) == 1
-
-    # __contains__
-    assert "fetch" in empty_table
-    assert "api.fetch" in empty_table
-    assert "missing" not in empty_table
-
-    # __iter__
-    records = list(empty_table)
-    assert len(records) == 1
-    assert records[0].name == "fetch"
-
-
-def test_lookup_by_file_pattern(empty_table: SymbolTable) -> None:
-    """Verify we can find symbols across directories using glob patterns."""
-    sym1 = Symbol(
-        name="f1", type="function", file_path="src/api.py", start_line=1, end_line=2
-    )
-    sym2 = Symbol(
-        name="f2", type="function", file_path="src/db.py", start_line=1, end_line=2
-    )
-    sym3 = Symbol(
-        name="t1",
-        type="function",
-        file_path="tests/test_api.py",
-        start_line=1,
-        end_line=2,
-    )
-
-    empty_table.register_symbols([sym1, sym2, sym3])
-
-    results = empty_table.lookup_by_file_pattern("src/*.py")
-    assert len(results) == 2
-    assert {r.name for r in results} == {"f1", "f2"}
-
-    results = empty_table.lookup_by_file_pattern("tests/*")
-    assert len(results) == 1
-    assert results[0].name == "t1"
-
-
-def test_lookup_by_position(empty_table: SymbolTable) -> None:
-    """Verify we can find the innermost symbol enclosing a specific line."""
-    method = Symbol(
-        name="inner",
+    method_sym = Symbol(
+        name="my_method",
         type="method",
-        file_path="auth.py",
-        start_line=10,
-        end_line=20,
-        qualified_name="Auth.inner",
-    )
-    cls = Symbol(
-        name="Auth",
-        type="class",
-        file_path="auth.py",
-        start_line=5,
-        end_line=25,
-        methods=[method],
-    )
-    empty_table.register_symbols([cls])
-
-    # Line 15 is inside both 'Auth' and 'inner', but 'inner' is tighter
-    innermost = empty_table.lookup_by_position("auth.py", 15)
-    assert innermost is not None
-    assert innermost.name == "inner"
-
-    # Line 6 is inside 'Auth' but outside 'inner'
-    outer = empty_table.lookup_by_position("auth.py", 6)
-    assert outer is not None
-    assert outer.name == "Auth"
-
-    # Line 30 is outside all symbols
-    assert empty_table.lookup_by_position("auth.py", 30) is None
-
-
-def test_clear(empty_table: SymbolTable) -> None:
-    """Verify clearing the table safely wipes all data and indices."""
-    sym = Symbol(name="f1", type="function", file_path="a.py", start_line=1, end_line=2)
-    empty_table.register_symbols([sym])
-    assert len(empty_table) == 1
-
-    empty_table.clear()
-
-    assert len(empty_table) == 0
-    assert empty_table.lookup("f1") == []
-    assert empty_table.lookup_by_type("function") == []
-    assert empty_table.lookup_by_file("a.py") == []
-
-
-def test_remove_by_file_and_update(empty_table: SymbolTable) -> None:
-    """Verify that removing and updating files cleanly maintains index integrity."""
-    method = Symbol(
-        name="inner",
-        type="method",
-        file_path="auth.py",
-        start_line=10,
-        end_line=20,
-        qualified_name="Auth.inner",
-    )
-    cls = Symbol(
-        name="Auth",
-        type="class",
-        file_path="auth.py",
-        start_line=5,
-        end_line=25,
-        methods=[method],
-    )
-    sym2 = Symbol(
-        name="other", type="function", file_path="other.py", start_line=1, end_line=5
+        file_path="src/app.py",
+        start_line=12,
+        end_line=18,
+        signature="def my_method(self)",
+        docstring="My method docstring.",
+        qualified_name="MyClass.my_method",
     )
 
-    empty_table.register_symbols([cls, sym2])
-    assert len(empty_table) == 3
-
-    # Remove auth.py
-    empty_table.remove_by_file("auth.py")
-
-    assert len(empty_table) == 1
-    assert len(empty_table.lookup_by_file("auth.py")) == 0
-    assert len(empty_table.lookup("Auth")) == 0
-    assert len(empty_table.lookup("inner")) == 0
-    assert len(empty_table.lookup("other")) == 1
-
-    # Update auth.py with new symbols
-    new_sym = Symbol(
-        name="NewAuth", type="class", file_path="auth.py", start_line=1, end_line=10
-    )
-    empty_table.update_file("auth.py", [new_sym])
-
-    assert len(empty_table) == 2
-    assert len(empty_table.lookup_by_file("auth.py")) == 1
-    assert empty_table.lookup("NewAuth")[0].name == "NewAuth"
-
-
-def test_serialization(empty_table: SymbolTable) -> None:
-    """Verify JSON serialization and deserialization retains all data and rebuilds indices."""
-    sym = Symbol(
+    class_sym = Symbol(
         name="MyClass",
         type="class",
-        file_path="models.py",
-        start_line=10,
-        end_line=20,
-        docstring="Test class",
-        signature=None,
-    )
-    empty_table.register_symbols([sym])
-
-    json_data = empty_table.to_json()
-    new_table = SymbolTable.from_json(json_data)
-
-    assert len(new_table) == 1
-    record = new_table.lookup("MyClass")[0]
-
-    assert record.name == "MyClass"
-    assert record.file_path == "models.py"
-    assert record.docstring == "Test class"
-
-    # Check that indices were rebuilt successfully
-    assert len(new_table.lookup("MyClass")) == 1
-    assert len(new_table.lookup_by_qualified_name("models.MyClass")) == 1
-    assert len(new_table.lookup_by_file("models.py")) == 1
-    assert len(new_table.lookup_by_type("class")) == 1
-
-
-def test_hierarchy_and_relational_pointers(empty_table: SymbolTable) -> None:
-    """Verify parent/child relationships and context breadcrumbs."""
-    method = Symbol(
-        name="inner",
-        type="method",
-        file_path="auth.py",
-        start_line=10,
-        end_line=20,
-        qualified_name="Auth.inner",
-    )
-    cls = Symbol(
-        name="Auth",
-        type="class",
-        file_path="auth.py",
+        file_path="src/app.py",
         start_line=5,
-        end_line=25,
-        methods=[method],
+        end_line=30,
+        docstring="My class.",
+        qualified_name="MyClass",
+        methods=[method_sym],
     )
-    empty_table.register_symbols([cls])
 
-    # 1. Relational Graph Pointers
-    auth_rec = empty_table.lookup("Auth")[0]
-    inner_rec = empty_table.lookup("inner")[0]
+    table.register_symbols([class_sym])
 
-    assert inner_rec.parent_id == auth_rec.symbol_id
-    assert empty_table.get_parent(inner_rec.symbol_id) == auth_rec
+    # Method should be registered recursively
+    results = table.lookup("my_method")
+    assert len(results) == 1
+    assert results[0].qualified_name == "src.app.MyClass.my_method"
 
-    children = empty_table.get_children(auth_rec.symbol_id)
-    assert len(children) == 1
-    assert children[0] == inner_rec
+    # Class lookup by suffix fully qualified name
+    class_results = table.lookup("MyClass")
+    assert len(class_results) == 1
+    assert class_results[0].qualified_name == "src.app.MyClass"
 
-    # 2. Context Breadcrumbs
-    hierarchy = empty_table.lookup_hierarchy_by_position("auth.py", 15)
-    assert len(hierarchy) == 2
-    assert hierarchy[0].name == "Auth"
-    assert hierarchy[1].name == "inner"
+    # Lookup by fully qualified name
+    res_fq = table.lookup("src.app.MyClass.my_method")
+    assert len(res_fq) == 1
+    assert res_fq[0].start_line == 12
 
 
-def test_fuzzy_search(empty_table: SymbolTable) -> None:
-    """Verify fuzzy typo-tolerant searching."""
-    sym1 = Symbol(
-        name="authenticate_user",
+def test_module_level_variables() -> None:
+    """Module-level variables can be registered and resolved."""
+    table = SymbolTable()
+
+    # Mock variables as Symbol objects
+    var1 = Symbol(
+        name="DEFAULT_TIMEOUT",
+        type="variable",
+        file_path="src/config.py",
+        start_line=5,
+        end_line=5,
+        signature="DEFAULT_TIMEOUT = 30",
+        docstring="Default timeout value.",
+    )
+
+    table.register_symbols([var1])
+
+    results = table.lookup("DEFAULT_TIMEOUT")
+    assert len(results) == 1
+    assert results[0].qualified_name == "src.config.DEFAULT_TIMEOUT"
+    assert results[0].type == "variable"
+
+    res_fq = table.lookup("src.config.DEFAULT_TIMEOUT")
+    assert len(res_fq) == 1
+    assert res_fq[0].signature == "DEFAULT_TIMEOUT = 30"
+
+
+def test_regex_lookup() -> None:
+    """Regex lookup finds all matching functions/symbols."""
+    table = SymbolTable()
+
+    symbols = [
+        Symbol(
+            name="test_login",
+            type="function",
+            file_path="tests/test_auth.py",
+            start_line=5,
+            end_line=15,
+        ),
+        Symbol(
+            name="test_logout",
+            type="function",
+            file_path="tests/test_auth.py",
+            start_line=20,
+            end_line=30,
+        ),
+        Symbol(
+            name="helper_func",
+            type="function",
+            file_path="tests/test_auth.py",
+            start_line=35,
+            end_line=40,
+        ),
+    ]
+
+    table.register_symbols(symbols)
+
+    # Search for all test functions
+    test_results = table.lookup("test_.*")
+    assert len(test_results) == 2
+    names = {r.name for r in test_results}
+    assert names == {"test_login", "test_logout"}
+
+    # Search by anchor
+    logout_results = table.lookup(".*logout$")
+    assert len(logout_results) == 1
+    assert logout_results[0].name == "test_logout"
+
+
+def test_lookup_by_file_path() -> None:
+    """Lookup by file path matches correctly."""
+    table = SymbolTable()
+
+    symbols = [
+        Symbol(
+            name="foo",
+            type="function",
+            file_path="src/foo.py",
+            start_line=1,
+            end_line=5,
+        ),
+        Symbol(
+            name="bar",
+            type="function",
+            file_path="src/bar.py",
+            start_line=1,
+            end_line=5,
+        ),
+    ]
+
+    table.register_symbols(symbols)
+
+    # Exact file path match
+    res_exact = table.lookup("src/foo.py")
+    assert len(res_exact) == 1
+    assert res_exact[0].name == "foo"
+
+    # Endswith suffix match
+    res_suffix = table.lookup("bar.py")
+    assert len(res_suffix) == 1
+    assert res_suffix[0].name == "bar"
+
+
+def test_json_serialization_deserialization() -> None:
+    """SymbolTable can be serialized to and deserialized from JSON."""
+    table = SymbolTable()
+
+    sym = Symbol(
+        name="process_data",
         type="function",
-        file_path="auth.py",
-        start_line=1,
-        end_line=2,
+        file_path="src/processor.py",
+        start_line=10,
+        end_line=20,
+        signature="def process_data(data)",
+        docstring="Process incoming data.",
     )
-    sym2 = Symbol(
-        name="fetch_data", type="function", file_path="api.py", start_line=1, end_line=2
-    )
-    empty_table.register_symbols([sym1, sym2])
 
-    # User makes a typo 'auth_user'
-    results = empty_table.lookup_fuzzy("auth_user")
-    assert len(results) == 1
-    assert results[0].name == "authenticate_user"
+    table.register_symbols([sym])
 
-    # User types 'fet_dat'
-    results = empty_table.lookup_fuzzy("fet_dat")
+    # Serialize
+    json_str = table.to_json()
+    assert isinstance(json_str, str)
+
+    # Check that it's valid JSON containing expected data
+    parsed_json = json.loads(json_str)
+    assert len(parsed_json) == 1
+    key = list(parsed_json.keys())[0]
+    assert key == "src/processor.py::src.processor.process_data"
+    assert parsed_json[key]["name"] == "process_data"
+
+    # Deserialize
+    loaded_table = SymbolTable.from_json(json_str)
+    assert len(loaded_table.registry) == 1
+
+    # Verify lookup on loaded table
+    results = loaded_table.lookup("process_data")
     assert len(results) == 1
-    assert results[0].name == "fetch_data"
+    record = results[0]
+    assert record.name == "process_data"
+    assert record.file_path == "src/processor.py"
+    assert record.start_line == 10
+    assert record.end_line == 20
+    assert record.signature == "def process_data(data)"
+    assert record.docstring == "Process incoming data."
+    assert record.qualified_name == "src.processor.process_data"

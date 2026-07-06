@@ -7,423 +7,210 @@ qualified name, regex pattern, and file path.
 
 from __future__ import annotations
 
-import bisect
-import difflib
-import fnmatch
-import hashlib
 import json
 import re
-import threading
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
-from pathlib import PurePosixPath
+from pathlib import Path
 from typing import Any
 
-from src.reporag.ingestion.symbol_extractor import Symbol
+# Import Symbol safely for type annotations
+try:
+    from ..ingestion.symbol_extractor import Symbol
+except ImportError:
+    # Fallback/Mock for testing or if environment differs
+    Symbol = Any
 
 
-@dataclass(slots=True)
+@dataclass
 class SymbolRecord:
-    """A record representing a symbol in the global registry."""
+    """Metadata record for a registered symbol."""
 
     symbol_id: str
-    name: str
-    qualified_name: str
-    type: str
     file_path: str
     start_line: int
     end_line: int
+    type: str
     signature: str | None
     docstring: str | None
-    parent_id: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert to a JSON-serializable dictionary."""
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> SymbolRecord:
-        """Create a SymbolRecord from a dictionary."""
-        return cls(**data)  # type: ignore
+    name: str
+    qualified_name: str
 
 
 class SymbolTable:
-    """The central registry for all symbols in the repository."""
+    """Global registry mapping symbol IDs to metadata records.
+
+    Allows registering extracted symbols and performing lookup by exact name,
+    fully qualified name, regex pattern, and file path. Can be serialized to/from JSON.
+    """
 
     def __init__(self) -> None:
-        """Initialise an empty symbol table."""
-        self._lock = threading.RLock()
-        self._registry: dict[str, SymbolRecord] = {}
-        self._name_index: dict[str, set[str]] = {}
-        self._qualified_name_index: dict[str, set[str]] = {}
-        self._file_index: dict[str, set[str]] = {}
-        self._type_index: dict[str, set[str]] = {}
-        self._children_index: dict[str, set[str]] = {}
-        self._file_intervals: dict[str, list[tuple[int, int, str]]] = {}
+        """Initialize an empty symbol table."""
+        self.registry: dict[str, SymbolRecord] = {}
 
-        # Caches for expensive queries
-        self._regex_cache: dict[str, list[SymbolRecord]] = {}
-        self._fuzzy_cache: dict[tuple[str, int], list[SymbolRecord]] = {}
+    def _get_module_name(self, file_path: str | None) -> str:
+        """Construct the dotted module path from a file path."""
+        if not file_path or file_path == "<string>":
+            return ""
 
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._registry)
+        # Normalize separators
+        path_str = file_path.replace("\\", "/")
+        path = Path(path_str)
 
-    def __iter__(self) -> Iterator[SymbolRecord]:
-        with self._lock:
-            return iter(list(self._registry.values()))
+        if path.is_absolute():
+            # Try to make it relative to CWD if possible
+            try:
+                path = path.relative_to(Path.cwd())
+            except ValueError:
+                # Fall back to finding 'src' or 'reporag' in path parts to strip root path
+                parts = list(path.parts)
+                if "src" in parts:
+                    idx = parts.index("src")
+                    path = Path(*parts[idx:])
+                elif "reporag-ai_2" in parts:
+                    idx = parts.index("reporag-ai_2")
+                    path = Path(*parts[idx + 1 :])
 
-    def __contains__(self, item: str) -> bool:
-        with self._lock:
-            return item in self._name_index or item in self._qualified_name_index
+        # Split path and append stem
+        parts = list(path.parent.parts) + [path.stem]
+        if path.stem == "__init__":
+            parts = parts[:-1]
 
-    def clear(self) -> None:
-        """Safely clear the entire registry and all indices."""
-        with self._lock:
-            self._registry.clear()
-            self._name_index.clear()
-            self._qualified_name_index.clear()
-            self._file_index.clear()
-            self._type_index.clear()
-            self._children_index.clear()
-            self._file_intervals.clear()
-            self._regex_cache.clear()
-            self._fuzzy_cache.clear()
+        # Clean empty and root characters
+        cleaned_parts = [p for p in parts if p not in ("", ".", "/")]
+        return ".".join(cleaned_parts)
 
-    def _remove_sids_from_index(
-        self, index: dict[str, set[str]], keys: Iterable[str], sids_to_remove: set[str]
-    ) -> None:
-        """Helper to efficiently remove multiple SIDs from a set index."""
-        for key in keys:
-            if key in index:
-                index[key].difference_update(sids_to_remove)
-                if not index[key]:
-                    del index[key]
+    def register_symbols(self, all_symbols: Iterable[Symbol]) -> None:
+        """Register all symbols with fully qualified names (module.class.method)."""
+        visited = set()
 
-    def remove_by_file(self, file_path: str) -> None:
-        """Remove all symbols associated with a specific file path."""
-        with self._lock:
-            sids_to_remove = self._file_index.pop(file_path, None)
-            if not sids_to_remove:
+        def _register(sym: Any) -> None:
+            # Handle dictionary-like inputs or Symbol objects
+            is_dict = isinstance(sym, dict)
+
+            # Avoid cyclic/redundant processing by storing id(sym) or a unique identifier
+            sym_ref = id(sym) if not is_dict else sym.get("symbol_id", str(sym))
+            if sym_ref in visited:
+                return
+            visited.add(sym_ref)
+
+            # Extract fields
+            name = sym.get("name") if is_dict else getattr(sym, "name", None)
+            file_path = (
+                sym.get("file_path") if is_dict else getattr(sym, "file_path", None)
+            )
+            start_line = (
+                sym.get("start_line") if is_dict else getattr(sym, "start_line", 0)
+            )
+            end_line = sym.get("end_line") if is_dict else getattr(sym, "end_line", 0)
+            sym_type = sym.get("type") if is_dict else getattr(sym, "type", "unknown")
+            signature = (
+                sym.get("signature") if is_dict else getattr(sym, "signature", None)
+            )
+            docstring = (
+                sym.get("docstring") if is_dict else getattr(sym, "docstring", None)
+            )
+            local_qname = (
+                sym.get("qualified_name")
+                if is_dict
+                else getattr(sym, "qualified_name", None)
+            )
+
+            if not name:
                 return
 
-        affected_names = set()
-        affected_qnames = set()
-        affected_types = set()
-        affected_parents = set()
+            # Clean/determine module name and qualified name
+            module_name = self._get_module_name(file_path)
+            qname_suffix = local_qname or name
 
-        for sid in sids_to_remove:
-            record = self._registry.pop(sid, None)
-            if not record:
-                continue
+            if module_name and module_name != "<string>":
+                fully_qualified = f"{module_name}.{qname_suffix}"
+            else:
+                fully_qualified = qname_suffix
 
-            affected_names.add(record.name)
-            affected_qnames.add(record.qualified_name)
-            affected_types.add(record.type)
-            if record.parent_id:
-                affected_parents.add(record.parent_id)
+            # Ensure symbol_id is unique
+            symbol_id = f"{file_path}::{fully_qualified}"
 
-            self._children_index.pop(sid, None)
+            record = SymbolRecord(
+                symbol_id=symbol_id,
+                file_path=file_path or "",
+                start_line=start_line,
+                end_line=end_line,
+                type=str(sym_type),
+                signature=signature,
+                docstring=docstring,
+                name=name,
+                qualified_name=fully_qualified,
+            )
+            self.registry[symbol_id] = record
 
-        self._remove_sids_from_index(self._name_index, affected_names, sids_to_remove)
-        self._remove_sids_from_index(
-            self._qualified_name_index, affected_qnames, sids_to_remove
-        )
-        self._remove_sids_from_index(self._type_index, affected_types, sids_to_remove)
-        self._remove_sids_from_index(
-            self._children_index, affected_parents, sids_to_remove
-        )
-        self._file_intervals.pop(file_path, None)
-        self._regex_cache.clear()
-        self._fuzzy_cache.clear()
+            # Recursively register methods / children
+            methods = sym.get("methods") if is_dict else getattr(sym, "methods", [])
+            children = sym.get("children") if is_dict else getattr(sym, "children", [])
 
-    def update_file(self, file_path: str, symbols: Iterable[Symbol]) -> None:
-        """Replace all symbols for a specific file with a new set of symbols."""
-        self.remove_by_file(file_path)
-        self.register_symbols(symbols)
+            if methods:
+                for method in methods:
+                    _register(method)
+            if children:
+                for child in children:
+                    _register(child)
 
-    def _infer_module_name(self, file_path: str) -> str:
-        """Convert a file path into a Python module name.
+        for sym in all_symbols:
+            _register(sym)
 
-        Handles absolute paths by stripping arbitrary OS prefixes and
-        anchoring at standard source roots like 'src', 'app', or 'lib'.
-        """
-        pure = PurePosixPath(file_path.replace("\\", "/"))
-        parts = list(pure.parts[:-1]) + [pure.stem]
+    def lookup(self, query: str) -> list[SymbolRecord]:
+        """Look up symbols by exact name, fully qualified name, regex pattern, or file path."""
+        matched: dict[str, SymbolRecord] = {}
 
-        # Anchor to known source directories to avoid absolute path pollution
-        for anchor in ("src", "app", "lib", "site-packages"):
-            if anchor in parts:
-                parts = parts[parts.index(anchor) :]
-                break
+        # 1. Exact match on name
+        for record in self.registry.values():
+            if record.name == query:
+                matched[record.symbol_id] = record
 
-        if parts and parts[-1] == "__init__":
-            parts = parts[:-1]
-        return ".".join(p for p in parts if p not in ("", ".", "/"))
-
-    def _generate_symbol_id(
-        self, file_path: str, qualified_name: str, start_line: int
-    ) -> str:
-        """Generate a stable, deterministic ID for a symbol to ensure idempotent ingestion."""
-        unique_str = f"{file_path}::{qualified_name}"
-        base_id = hashlib.sha1(unique_str.encode("utf-8")).hexdigest()[:16]
-
-        final_id = base_id
-        counter = 1
-        while final_id in self._registry:
-            existing = self._registry[final_id]
-            # If it's the exact same symbol (re-entrant parsing), keep the ID
-            if (
-                existing.file_path == file_path
-                and existing.qualified_name == qualified_name
-                and existing.start_line == start_line
+        # 2. Exact match or suffix match on fully qualified name
+        for record in self.registry.values():
+            if record.qualified_name == query or record.qualified_name.endswith(
+                "." + query
             ):
-                break
-            final_id = f"{base_id}_{counter}"
-            counter += 1
+                matched[record.symbol_id] = record
 
-        return final_id
+        # 3. Match on file path
+        # Match exact file path, or if file path ends with query (e.g. "symbol_table.py")
+        for record in self.registry.values():
+            if record.file_path == query or record.file_path.replace(
+                "\\", "/"
+            ).endswith("/" + query.replace("\\", "/")):
+                matched[record.symbol_id] = record
 
-    def _flatten_and_register(
-        self, symbol: Symbol, module_name: str, parent_id: str | None = None
-    ) -> None:
-        """Recursively flatten and register a symbol and its children."""
-        # Compute fully qualified name
-        qname = symbol.qualified_name or symbol.name
-        fully_qualified_name = f"{module_name}.{qname}" if module_name else qname
-
-        symbol_id = self._generate_symbol_id(
-            symbol.file_path, fully_qualified_name, symbol.start_line
-        )
-
-        record = SymbolRecord(
-            symbol_id=symbol_id,
-            name=symbol.name,
-            qualified_name=fully_qualified_name,
-            type=symbol.type,
-            file_path=symbol.file_path,
-            start_line=symbol.start_line,
-            end_line=symbol.end_line,
-            signature=symbol.signature,
-            docstring=symbol.docstring,
-            parent_id=parent_id,
-        )
-
-        self._registry[symbol_id] = record
-
-        self._name_index.setdefault(record.name, set()).add(symbol_id)
-        self._qualified_name_index.setdefault(record.qualified_name, set()).add(
-            symbol_id
-        )
-        self._file_index.setdefault(record.file_path, set()).add(symbol_id)
-        self._type_index.setdefault(record.type, set()).add(symbol_id)
-
-        if parent_id:
-            self._children_index.setdefault(parent_id, set()).add(symbol_id)
-
-        for child in symbol.methods:
-            self._flatten_and_register(child, module_name, parent_id=symbol_id)
-        for child in symbol.children:
-            self._flatten_and_register(child, module_name, parent_id=symbol_id)
-
-    def register_symbols(self, symbols: Iterable[Symbol]) -> None:
-        """Register a list of root symbols and their children recursively."""
-        with self._lock:
-            modified_files = set()
-            for symbol in symbols:
-                module_name = self._infer_module_name(symbol.file_path)
-                self._flatten_and_register(symbol, module_name)
-                modified_files.add(symbol.file_path)
-
-            # Rebuild O(log N) positional intervals for modified files
-            for file_path in modified_files:
-                intervals = [
-                    (r.start_line, r.end_line, r.symbol_id)
-                    for r in self.lookup_by_file(file_path)
-                ]
-                intervals.sort(key=lambda x: x[0])
-                self._file_intervals[file_path] = intervals
-
-            self._regex_cache.clear()
-            self._fuzzy_cache.clear()
-
-    def get_by_id(self, symbol_id: str) -> SymbolRecord | None:
-        """Retrieve a symbol directly by its unique ID."""
-        return self._registry.get(symbol_id)
-
-    def lookup(self, name: str) -> list[SymbolRecord]:
-        """Lookup symbols by exact name (e.g. 'authenticate')."""
-        with self._lock:
-            return [self._registry[sid] for sid in self._name_index.get(name, {})]
-
-    def lookup_by_qualified_name(self, qualified_name: str) -> list[SymbolRecord]:
-        """Lookup symbols by fully qualified name (returns unique match per file)."""
-        with self._lock:
-            return [
-                self._registry[sid]
-                for sid in self._qualified_name_index.get(qualified_name, {})
-            ]
-
-    def lookup_by_regex(self, pattern: str) -> list[SymbolRecord]:
-        """Lookup symbols using a regex pattern against the fully qualified name or name."""
-        with self._lock:
-            if pattern in self._regex_cache:
-                return list(self._regex_cache[pattern])
-
+        # 4. Regex match
+        # Perform regex lookup only if the query contains regex metacharacters
+        is_regex = any(c in query for c in "*?+[]()^{}|\\$")
+        if is_regex:
             try:
-                regex = re.compile(pattern)
-            except re.error as e:
-                raise ValueError(f"Invalid regex pattern: '{pattern}'") from e
+                pattern = re.compile(query)
+                for record in self.registry.values():
+                    if pattern.match(record.name) or pattern.match(
+                        record.qualified_name
+                    ):
+                        matched[record.symbol_id] = record
+            except re.error:
+                pass
 
-            results = [
-                record
-                for record in self._registry.values()
-                if regex.search(record.name) or regex.search(record.qualified_name)
-            ]
-            self._regex_cache[pattern] = results
-            return list(results)
-
-    def lookup_fuzzy(self, query: str, limit: int = 3) -> list[SymbolRecord]:
-        """Fuzzy search for typo-tolerant matching against symbol names."""
-        with self._lock:
-            cache_key = (query, limit)
-            if cache_key in self._fuzzy_cache:
-                return list(self._fuzzy_cache[cache_key])
-
-            # Fallback to fast substring matching first to save heavy difflib CPU cycles
-            query_lower = query.lower()
-            exact_substring_matches = [
-                name for name in self._name_index if query_lower in name.lower()
-            ]
-
-            # Only use difflib on the filtered subset if possible, else full keys
-            search_space = (
-                exact_substring_matches
-                if exact_substring_matches
-                else self._name_index.keys()
-            )
-
-            matches = difflib.get_close_matches(
-                query, search_space, n=limit, cutoff=0.6
-            )
-
-            results = []
-            for match in matches:
-                # Extend matches from exact lookup
-                results.extend(self.lookup(match))
-
-            final_results = results[:limit]
-            self._fuzzy_cache[cache_key] = final_results
-            return list(final_results)
-
-    def lookup_by_file(self, file_path: str) -> list[SymbolRecord]:
-        """Lookup all symbols defined in a specific file."""
-        with self._lock:
-            return [self._registry[sid] for sid in self._file_index.get(file_path, {})]
-
-    def lookup_by_file_pattern(self, glob_pattern: str) -> list[SymbolRecord]:
-        """Lookup symbols across files matching a glob pattern."""
-        with self._lock:
-            results = []
-            for file_path, sids in self._file_index.items():
-                if fnmatch.fnmatch(file_path, glob_pattern):
-                    for sid in sids:
-                        results.append(self._registry[sid])
-            return results
-
-    def lookup_by_type(self, symbol_type: str) -> list[SymbolRecord]:
-        """Lookup all symbols of a specific type (e.g. 'class', 'function')."""
-        with self._lock:
-            return [
-                self._registry[sid] for sid in self._type_index.get(symbol_type, {})
-            ]
-
-    def lookup_by_position(
-        self, file_path: str, line_number: int
-    ) -> SymbolRecord | None:
-        """Find the innermost symbol that encloses the given line number in a file."""
-        with self._lock:
-            intervals = self._file_intervals.get(file_path)
-            if not intervals:
-                return None
-
-            # O(log N) search for the right-most interval whose start_line <= line_number
-            idx = bisect.bisect_right(intervals, (line_number, float("inf"), ""))
-
-            best_match = None
-            min_length = float("inf")
-
-            # Walk backwards from insertion point to find the tightest wrapping interval
-            for i in range(idx - 1, -1, -1):
-                start, end, sid = intervals[i]
-                if start <= line_number <= end:
-                    length = end - start
-                    if length < min_length:
-                        min_length = length
-                        best_match = sid
-
-            if best_match:
-                return self._registry.get(best_match)
-            return None
-
-    def lookup_hierarchy_by_position(
-        self, file_path: str, line_number: int
-    ) -> list[SymbolRecord]:
-        """Return the stack of symbols enclosing the position, from outermost to innermost."""
-        with self._lock:
-            innermost = self.lookup_by_position(file_path, line_number)
-            if not innermost:
-                return []
-
-            hierarchy = []
-            current = innermost
-            while current:
-                hierarchy.insert(0, current)
-                current = (
-                    self.get_parent(current.symbol_id) if current.parent_id else None
-                )
-
-            return hierarchy
-
-    def get_parent(self, symbol_id: str) -> SymbolRecord | None:
-        """Retrieve the parent symbol of a given symbol_id."""
-        with self._lock:
-            record = self._registry.get(symbol_id)
-            if record and record.parent_id:
-                return self._registry.get(record.parent_id)
-            return None
-
-    def get_children(self, symbol_id: str) -> list[SymbolRecord]:
-        """Retrieve all immediate children of a given symbol_id."""
-        with self._lock:
-            return [
-                self._registry[sid] for sid in self._children_index.get(symbol_id, {})
-            ]
+        return list(matched.values())
 
     def to_json(self) -> str:
-        """Serialize the symbol table to JSON."""
-        with self._lock:
-            data = {sid: record.to_dict() for sid, record in self._registry.items()}
-            return json.dumps(data)
+        """Serialize the symbol table to a JSON string."""
+        data = {
+            symbol_id: asdict(record) for symbol_id, record in self.registry.items()
+        }
+        return json.dumps(data, indent=2)
 
     @classmethod
     def from_json(cls, json_str: str) -> SymbolTable:
-        """Deserialize a symbol table from JSON."""
-        try:
-            data = json.loads(json_str)
-        except json.JSONDecodeError:
-            return cls()
-
+        """Deserialize the symbol table from a JSON string."""
         table = cls()
-        for sid, record_dict in data.items():
-            record = SymbolRecord.from_dict(record_dict)
-            table._registry[sid] = record
-            table._name_index.setdefault(record.name, set()).add(sid)
-            table._qualified_name_index.setdefault(record.qualified_name, set()).add(
-                sid
-            )
-            table._file_index.setdefault(record.file_path, set()).add(sid)
-            table._type_index.setdefault(record.type, set()).add(sid)
-            if record.parent_id:
-                table._children_index.setdefault(record.parent_id, set()).add(sid)
+        data = json.loads(json_str)
+        for symbol_id, record_dict in data.items():
+            record = SymbolRecord(**record_dict)
+            table.registry[symbol_id] = record
         return table
