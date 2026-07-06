@@ -122,12 +122,28 @@ class SymbolTable:
                 else getattr(sym, "qualified_name", None)
             )
 
-            is_async = sym.get("is_async") if is_dict else getattr(sym, "is_async", False)
-            decorators = sym.get("decorators") if is_dict else getattr(sym, "decorators", [])
+            is_async = (
+                sym.get("is_async") if is_dict else getattr(sym, "is_async", False)
+            )
+            decorators = (
+                sym.get("decorators") if is_dict else getattr(sym, "decorators", [])
+            )
             bases = sym.get("bases") if is_dict else getattr(sym, "bases", [])
-            import_source = sym.get("import_source") if is_dict else getattr(sym, "import_source", None)
-            import_alias = sym.get("import_alias") if is_dict else getattr(sym, "import_alias", None)
-            is_wildcard_import = sym.get("is_wildcard_import") if is_dict else getattr(sym, "is_wildcard_import", False)
+            import_source = (
+                sym.get("import_source")
+                if is_dict
+                else getattr(sym, "import_source", None)
+            )
+            import_alias = (
+                sym.get("import_alias")
+                if is_dict
+                else getattr(sym, "import_alias", None)
+            )
+            is_wildcard_import = (
+                sym.get("is_wildcard_import")
+                if is_dict
+                else getattr(sym, "is_wildcard_import", False)
+            )
 
             if not name:
                 return

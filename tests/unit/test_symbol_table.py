@@ -274,4 +274,3 @@ def test_import_symbol_details() -> None:
     assert record.import_source == "flask"
     assert record.import_alias == "F"
     assert record.is_wildcard_import is False
-
