@@ -213,6 +213,10 @@ class SymbolTable:
             module_name = self._infer_module_name(symbol.file_path)
             self._flatten_and_register(symbol, module_name)
 
+    def get_by_id(self, symbol_id: str) -> SymbolRecord | None:
+        """Retrieve a symbol directly by its unique ID."""
+        return self._registry.get(symbol_id)
+
     def lookup(self, name: str) -> list[SymbolRecord]:
         """Lookup symbols by exact name (e.g. 'authenticate')."""
         return [self._registry[sid] for sid in self._name_index.get(name, {})]
