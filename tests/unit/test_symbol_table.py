@@ -154,6 +154,24 @@ def test_lookup_by_type(empty_table: SymbolTable) -> None:
     assert classes[0].name == "C1"
 
 
+def test_module_level_vars(empty_table: SymbolTable) -> None:
+    """Verify registration and lookup of module-level variables."""
+    sym = Symbol(
+        name="GLOBAL_TIMEOUT",
+        type="variable",
+        file_path="config.py",
+        start_line=10,
+        end_line=10,
+        docstring="The global timeout",
+    )
+    empty_table.register_symbols([sym])
+
+    results = empty_table.lookup("GLOBAL_TIMEOUT")
+    assert len(results) == 1
+    assert results[0].type == "variable"
+    assert results[0].qualified_name == "config.GLOBAL_TIMEOUT"
+
+
 def test_collection_protocols(empty_table: SymbolTable) -> None:
     """Verify pythonic container behaviors like len(), in, and iter()."""
     sym = Symbol(
