@@ -69,5 +69,14 @@ jobs:
         run: |
           pip install -r requirements.txt
           pip install pytest pytest-cov pytest-asyncio
+
+      - name: Debug Black
+        run: |
+          which black
+          black --version
+          pip show black
+          black --check src/ tests/
+          black --diff tests/unit/test_symbol_table.py
+
       - name: Run tests
         run: pytest tests/unit/ -v --tb=short --timeout=60
