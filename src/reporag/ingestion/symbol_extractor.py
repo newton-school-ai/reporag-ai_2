@@ -15,7 +15,7 @@ from tree_sitter import Node, Tree
 
 from src.reporag.ingestion.parser import ASTParser, UnsupportedLanguageError
 
-SymbolType = Literal["class", "function", "method", "import"]
+SymbolType = Literal["class", "function", "method", "import", "variable"]
 
 
 @dataclass
