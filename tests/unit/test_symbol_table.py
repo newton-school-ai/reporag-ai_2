@@ -345,12 +345,10 @@ def test_build_from_symbols_matches_build_from_sources(table: SymbolTable) -> No
 def test_build_from_files(tmp_path) -> None:
     """build_from_files parses files from disk and registers their symbols."""
     source = tmp_path / "sample.py"
-    source.write_text(
-        """
+    source.write_text("""
 def hello():
     pass
-"""
-    )
+""")
 
     table = SymbolTable.build_from_files([source])
 
@@ -362,12 +360,10 @@ def hello():
 def test_build_from_files_skips_unreadable_file(tmp_path) -> None:
     """Unreadable files are skipped instead of failing the entire build."""
     good = tmp_path / "good.py"
-    good.write_text(
-        """
+    good.write_text("""
 def ok():
     pass
-"""
-    )
+""")
 
     missing = tmp_path / "missing.py"
 
