@@ -44,12 +44,19 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install linters
-        run: pip install ruff black
+        run: pip install -r requirements.txt
+
+      - name: Show Black version
+        run: black --version
+
+      - name: Show Black diff
+        run: black --diff tests/unit/test_symbol_table.py
+
       - name: Ruff check
         run: ruff check src/ tests/
+
       - name: Black check
         run: black --check src/ tests/
-
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
@@ -62,5 +69,6 @@ jobs:
         run: |
           pip install -r requirements.txt
           pip install pytest pytest-cov pytest-asyncio
+
       - name: Run tests
         run: pytest tests/unit/ -v --tb=short --timeout=60
