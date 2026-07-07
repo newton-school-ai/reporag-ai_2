@@ -440,13 +440,11 @@ class Neo4jStore(GraphStore):
     def _ensure_constraints(self) -> None:
         """Create uniqueness constraint on node id if it does not exist."""
 
-        self.query(
-            """
+        self.query("""
             CREATE CONSTRAINT node_id_unique IF NOT EXISTS
             FOR (n)
             REQUIRE n.id IS UNIQUE
-            """
-        )
+            """)
 
     def close(self) -> None:
         """Close the driver, releasing all underlying connections."""
