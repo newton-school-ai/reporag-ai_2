@@ -536,13 +536,9 @@ class Neo4jGraphStore(GraphStore):
 
         for s in symbols:
             if s.parent:
-                contains_rows.append(
-                    {"parent_id": s.parent, "child_id": s.symbol_id}
-                )
+                contains_rows.append({"parent_id": s.parent, "child_id": s.symbol_id})
             for base in s.bases:
-                inherits_rows.append(
-                    {"class_id": s.symbol_id, "base_name": base}
-                )
+                inherits_rows.append({"class_id": s.symbol_id, "base_name": base})
 
         with self._session() as session:
             for batch in _chunks(contains_rows, _NEO4J_BATCH_SIZE):
@@ -619,8 +615,8 @@ class Neo4jGraphStore(GraphStore):
         """
         rows = [
             {
-                "source_id": e.source,        # file path used as node_id
-                "target_id": e.target,        # file path used as node_id
+                "source_id": e.source,  # file path used as node_id
+                "target_id": e.target,  # file path used as node_id
                 "source_module": e.source_module,
                 "target_module": e.target_module,
                 "import_type": e.import_type,
@@ -744,9 +740,7 @@ class Neo4jGraphStore(GraphStore):
                 if n and hasattr(n, "items"):
                     nid = n.get("node_id", "")
                     label = list(n.labels)[0] if hasattr(n, "labels") else "Symbol"
-                    nodes[nid] = GraphNode(
-                        node_id=nid, label=label, properties=dict(n)
-                    )
+                    nodes[nid] = GraphNode(node_id=nid, label=label, properties=dict(n))
             r = row.get("r")
             if r and hasattr(r, "start_node"):
                 edges.append(
@@ -884,7 +878,10 @@ class NetworkXGraphStore(GraphStore):
             if not e.resolved:
                 continue
             # Auto-stub module nodes keyed by file path if absent
-            for nid, mod_name in ((e.source, e.source_module), (e.target, e.target_module)):
+            for nid, mod_name in (
+                (e.source, e.source_module),
+                (e.target, e.target_module),
+            ):
                 if nid not in self._graph:
                     self._graph.add_node(
                         nid,
@@ -963,7 +960,9 @@ class NetworkXGraphStore(GraphStore):
                     key = (src, tgt, rt)
                     if key not in seen_edges:
                         seen_edges.add(key)
-                        collected_edges.append(GraphEdge(source=src, target=tgt, rel_type=rt))
+                        collected_edges.append(
+                            GraphEdge(source=src, target=tgt, rel_type=rt)
+                        )
             visited |= next_frontier
             frontier = next_frontier
 
@@ -980,11 +979,7 @@ class NetworkXGraphStore(GraphStore):
 
     def _directed_rel_type(self, a: str, b: str) -> str:
         """Return the ``rel_type`` of the directed edge between *a* and *b*."""
-        data = (
-            self._graph.get_edge_data(a, b)
-            or self._graph.get_edge_data(b, a)
-            or {}
-        )
+        data = self._graph.get_edge_data(a, b) or self._graph.get_edge_data(b, a) or {}
         return data.get("rel_type", "")
 
     def shortest_path(
@@ -1072,9 +1067,7 @@ class NetworkXGraphStore(GraphStore):
             return [{"cnt": self._graph.number_of_nodes()}]
 
         # --- count(r) by relationship type ---
-        m = re.search(
-            r"MATCH \(\)-\[r:(\w+)\]->\(\) RETURN count\(r\) AS cnt", q, re.I
-        )
+        m = re.search(r"MATCH \(\)-\[r:(\w+)\]->\(\) RETURN count\(r\) AS cnt", q, re.I)
         if m:
             rel_type = m.group(1).upper()  # normalise so CALLS == calls
             cnt = sum(
@@ -1092,11 +1085,11 @@ class NetworkXGraphStore(GraphStore):
             re.I,
         )
         if m:
-            a_label = m.group(2)   # may be None (no label filter)
-            rel_type = m.group(3).upper()   # normalise casing
-            b_label = m.group(5)   # may be None
-            a_ret = m.group(6)     # e.g. "f.name"
-            b_ret = m.group(7)     # e.g. "g.name"
+            a_label = m.group(2)  # may be None (no label filter)
+            rel_type = m.group(3).upper()  # normalise casing
+            b_label = m.group(5)  # may be None
+            a_ret = m.group(6)  # e.g. "f.name"
+            b_ret = m.group(7)  # e.g. "g.name"
             a_prop = a_ret.split(".")[-1]
             b_prop = b_ret.split(".")[-1]
             limit = int(m.group(8)) if m.group(8) else None
@@ -1112,9 +1105,7 @@ class NetworkXGraphStore(GraphStore):
                     continue
                 if b_label and v_data.get("label") != b_label:
                     continue
-                results.append(
-                    {a_ret: u_data.get(a_prop), b_ret: v_data.get(b_prop)}
-                )
+                results.append({a_ret: u_data.get(a_prop), b_ret: v_data.get(b_prop)})
                 if limit is not None and len(results) >= limit:
                     break
             return results

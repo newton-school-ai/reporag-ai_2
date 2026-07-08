@@ -70,8 +70,8 @@ class _CallEdge:
     call_site_line: int
     callee_file: str | None = None
     call_type: str = "function"
-    resolution: str = "unresolved"   # real default is "unresolved"
-    resolved: bool = False           # real default is False
+    resolution: str = "unresolved"  # real default is "unresolved"
+    resolved: bool = False  # real default is False
     is_recursive: bool = False
 
     def __post_init__(self) -> None:
@@ -89,11 +89,11 @@ class _DepEdge:
     target_module: str
     import_type: str = "from_import"
     imported_names: list[tuple[str, str | None]] = field(default_factory=list)
-    line: int = 0                    # real default is 0
+    line: int = 0  # real default is 0
     is_relative: bool = False
-    relative_level: int = 0          # field present in real DependencyEdge
+    relative_level: int = 0  # field present in real DependencyEdge
     is_wildcard: bool = False
-    resolved: bool = False           # real default is False
+    resolved: bool = False  # real default is False
 
 
 # ---------------------------------------------------------------------------
@@ -122,8 +122,13 @@ def _make_symbols(names: list[tuple[str, str, str]]) -> list[_Symbol]:
     ]
 
 
-def _call(caller: str, callee: str, caller_file: str, line: int,
-          callee_file: str | None = None) -> _CallEdge:
+def _call(
+    caller: str,
+    callee: str,
+    caller_file: str,
+    line: int,
+    callee_file: str | None = None,
+) -> _CallEdge:
     """Convenience factory for a resolved CALLS edge."""
     return _CallEdge(
         caller=caller,
@@ -131,11 +136,13 @@ def _call(caller: str, callee: str, caller_file: str, line: int,
         caller_file=caller_file,
         call_site_line=line,
         callee_file=callee_file,
-        resolution="local",  # triggers __post_init__ → resolved=True
+        resolution="local",  # triggers __post_init__ -> resolved=True
     )
 
 
-def _dep_edge(source_file: str, target_file: str, src_mod: str, tgt_mod: str) -> _DepEdge:
+def _dep_edge(
+    source_file: str, target_file: str, src_mod: str, tgt_mod: str
+) -> _DepEdge:
     """Convenience factory for a resolved IMPORTS edge."""
     return _DepEdge(
         source=source_file,
@@ -187,7 +194,7 @@ def test_graph_store_is_abstract() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Node creation — correct labels
+# Node creation - correct labels
 # ---------------------------------------------------------------------------
 
 
@@ -218,7 +225,9 @@ def test_persist_creates_module_nodes(store: NetworkXGraphStore) -> None:
     assert store.graph.nodes["auth"]["label"] == "Module"
 
 
-def test_persist_creates_symbol_nodes_for_unknown_type(store: NetworkXGraphStore) -> None:
+def test_persist_creates_symbol_nodes_for_unknown_type(
+    store: NetworkXGraphStore,
+) -> None:
     """Unknown types fall back to the Symbol label."""
     symbols = _make_symbols([("cfg.TIMEOUT", "TIMEOUT", "variable")])
     store.persist_graph([], [], symbols)
@@ -226,7 +235,7 @@ def test_persist_creates_symbol_nodes_for_unknown_type(store: NetworkXGraphStore
 
 
 # ---------------------------------------------------------------------------
-# Node creation — properties
+# Node creation - properties
 # ---------------------------------------------------------------------------
 
 
@@ -291,8 +300,14 @@ def test_unresolved_call_edge_skipped(store: NetworkXGraphStore) -> None:
     symbols = _make_symbols([("app.main", "main", "function")])
     # Default resolution is "unresolved", so __post_init__ sets resolved=False.
     store.persist_graph(
-        [_CallEdge(caller="app.main", callee="external.func",
-                   caller_file="app.py", call_site_line=3)],
+        [
+            _CallEdge(
+                caller="app.main",
+                callee="external.func",
+                caller_file="app.py",
+                call_site_line=3,
+            )
+        ],
         [],
         symbols,
     )
@@ -309,7 +324,7 @@ def test_recursive_call_edge(store: NetworkXGraphStore) -> None:
                 callee="util.recurse",
                 caller_file="util.py",
                 call_site_line=8,
-                resolution="local",   # resolved=True via __post_init__
+                resolution="local",  # resolved=True via __post_init__
                 is_recursive=True,
             )
         ],
@@ -432,7 +447,10 @@ def test_contains_edge_from_parent(store: NetworkXGraphStore) -> None:
     ]
     store.persist_graph([], [], symbols)
     assert store.graph.has_edge("auth.User", "auth.User.login")
-    assert store.graph.get_edge_data("auth.User", "auth.User.login")["rel_type"] == "CONTAINS"
+    assert (
+        store.graph.get_edge_data("auth.User", "auth.User.login")["rel_type"]
+        == "CONTAINS"
+    )
 
 
 def test_contains_edge_missing_parent_skipped(store: NetworkXGraphStore) -> None:
@@ -509,7 +527,9 @@ def test_inherits_edge_created(store: NetworkXGraphStore) -> None:
     ]
     store.persist_graph([], [], symbols)
     assert store.graph.has_edge("auth.User", "models.Base")
-    assert store.graph.get_edge_data("auth.User", "models.Base")["rel_type"] == "INHERITS"
+    assert (
+        store.graph.get_edge_data("auth.User", "models.Base")["rel_type"] == "INHERITS"
+    )
 
 
 def test_inherits_unknown_base_skipped(store: NetworkXGraphStore) -> None:
@@ -533,12 +553,31 @@ def test_inherits_unknown_base_skipped(store: NetworkXGraphStore) -> None:
 def test_inherits_multiple_bases(store: NetworkXGraphStore) -> None:
     """Multiple-inheritance produces one INHERITS edge per base."""
     symbols = [
-        _Symbol(symbol_id="m.Mixin", name="Mixin", qualified_name="m.Mixin",
-                type="class", file_path="m.py", module="m"),
-        _Symbol(symbol_id="m.Base", name="Base", qualified_name="m.Base",
-                type="class", file_path="m.py", module="m"),
-        _Symbol(symbol_id="m.Child", name="Child", qualified_name="m.Child",
-                type="class", file_path="m.py", module="m", bases=["Base", "Mixin"]),
+        _Symbol(
+            symbol_id="m.Mixin",
+            name="Mixin",
+            qualified_name="m.Mixin",
+            type="class",
+            file_path="m.py",
+            module="m",
+        ),
+        _Symbol(
+            symbol_id="m.Base",
+            name="Base",
+            qualified_name="m.Base",
+            type="class",
+            file_path="m.py",
+            module="m",
+        ),
+        _Symbol(
+            symbol_id="m.Child",
+            name="Child",
+            qualified_name="m.Child",
+            type="class",
+            file_path="m.py",
+            module="m",
+            bases=["Base", "Mixin"],
+        ),
     ]
     store.persist_graph([], [], symbols)
     assert store.graph.has_edge("m.Child", "m.Base")
@@ -634,9 +673,7 @@ def test_get_neighbors_rel_type_filter(store: NetworkXGraphStore) -> None:
 
 def test_get_neighbors_no_duplicate_edges(store: NetworkXGraphStore) -> None:
     """Each edge appears at most once in SubgraphResult.edges."""
-    symbols = _make_symbols(
-        [("a.A", "A", "function"), ("b.B", "B", "function")]
-    )
+    symbols = _make_symbols([("a.A", "A", "function"), ("b.B", "B", "function")])
     store.persist_graph(
         [_call("a.A", "b.B", "a.py", 1, "b.py")],
         [],
@@ -649,9 +686,7 @@ def test_get_neighbors_no_duplicate_edges(store: NetworkXGraphStore) -> None:
 
 def test_get_neighbors_returns_graph_node_instances(store: NetworkXGraphStore) -> None:
     """All items in SubgraphResult.nodes are GraphNode instances."""
-    symbols = _make_symbols(
-        [("a.A", "A", "function"), ("b.B", "B", "function")]
-    )
+    symbols = _make_symbols([("a.A", "A", "function"), ("b.B", "B", "function")])
     store.persist_graph(
         [_call("a.A", "b.B", "a.py", 1, "b.py")],
         [],
@@ -802,7 +837,7 @@ def test_get_subgraph_node_types(store: NetworkXGraphStore) -> None:
 
 
 # ---------------------------------------------------------------------------
-# query — Cypher mini-interpreter
+# query - Cypher mini-interpreter
 # ---------------------------------------------------------------------------
 
 
@@ -830,7 +865,9 @@ def test_query_count_imports(store: NetworkXGraphStore) -> None:
 
 def test_query_match_with_return(store: NetworkXGraphStore) -> None:
     """MATCH (f:Function)-[:CALLS]->(g:Function) RETURN f.name, g.name LIMIT 5."""
-    symbols = _make_symbols([("a.foo", "foo", "function"), ("b.bar", "bar", "function")])
+    symbols = _make_symbols(
+        [("a.foo", "foo", "function"), ("b.bar", "bar", "function")]
+    )
     store.persist_graph([_call("a.foo", "b.bar", "a.py", 3, "b.py")], [], symbols)
     rows = store.query(
         "MATCH (f:Function)-[:CALLS]->(g:Function) RETURN f.name, g.name LIMIT 5"
@@ -846,9 +883,7 @@ def test_query_match_limit_respected(store: NetworkXGraphStore) -> None:
         [(f"m.f{i}", f"f{i}", "function") for i in range(10)]
         + [(f"m.g{i}", f"g{i}", "function") for i in range(10)]
     )
-    edges = [
-        _call(f"m.f{i}", f"m.g{i}", "m.py", i + 1) for i in range(10)
-    ]
+    edges = [_call(f"m.f{i}", f"m.g{i}", "m.py", i + 1) for i in range(10)]
     store.persist_graph(edges, [], symbols)
     rows = store.query(
         "MATCH (f:Function)-[:CALLS]->(g:Function) RETURN f.name, g.name LIMIT 3"
@@ -975,7 +1010,7 @@ def test_bulk_insert_10k_edges(store: NetworkXGraphStore) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Neo4jGraphStore — no live instance tests
+# Neo4jGraphStore - no live instance tests
 # ---------------------------------------------------------------------------
 
 
@@ -1016,7 +1051,9 @@ def test_neo4j_store_import_without_driver(monkeypatch: pytest.MonkeyPatch) -> N
     try:
         mod = importlib.import_module(neo4j_mod_key)
         with pytest.raises(ImportError):
-            mod.Neo4jGraphStore(uri="bolt://localhost:9999", max_retries=1, retry_delay=0.0)
+            mod.Neo4jGraphStore(
+                uri="bolt://localhost:9999", max_retries=1, retry_delay=0.0
+            )
     finally:
         # Always restore the original cached module
         if original is not None:
