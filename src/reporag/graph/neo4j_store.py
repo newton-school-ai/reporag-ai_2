@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -854,22 +855,47 @@ class Neo4jGraphStore:
             len(seen),
         )
 
+    # All possible secondary labels used in this store (must stay in sync with
+    # _LABEL_MAP, _DEFAULT_LABEL, and _MODULE_LABEL).
+    _ALL_LABELS: tuple[str, ...] = ("Function", "Class", "Symbol", "Module")
+
     def _batch_merge_nodes(self, props_list: list[dict[str, Any]]) -> None:
-        """MERGE nodes in batches, applying the correct label per node."""
+        """MERGE nodes in batches using pure Cypher -- no APOC required.
+
+        Because Cypher does not support dynamic labels in a single statement,
+        we group the batch by the ``label`` field and issue one
+        ``MERGE (n:_Node:<Label> ...)`` statement per distinct label.  The
+        node is first upserted on ``_Node`` (the common base label) and then
+        the label-specific MERGE adds the secondary label atomically.  This is
+        equivalent to ``apoc.create.addLabels`` but works on any Neo4j instance
+        without any plugins installed.
+        """
         assert self._driver is not None
-        for batch in _chunk(props_list, self._batch_size):
-            with self._driver.session(database=self._database) as session:
-                session.run(
-                    """
-                    UNWIND $batch AS row
-                    MERGE (n:_Node {symbol_id: row.symbol_id})
-                    SET n += row
-                    WITH n, row
-                    CALL apoc.create.addLabels(n, [row.label]) YIELD node
-                    RETURN count(node)
-                    """,
-                    batch=batch,
+
+        label_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in props_list:
+            label_groups[row["label"]].append(row)
+
+        for label, group in label_groups.items():
+            # Guard against an unexpected label leaking in.
+            if label not in self._ALL_LABELS:
+                logger.warning(
+                    "_batch_merge_nodes: unknown label %r -- skipping %d node(s)",
+                    label,
+                    len(group),
                 )
+                continue
+
+            # Static Cypher: label is baked into the query string, not a
+            # parameter, so Neo4j can plan it properly.
+            cypher = f"""
+                UNWIND $batch AS row
+                MERGE (n:_Node:{label} {{symbol_id: row.symbol_id}})
+                SET n += row
+            """
+            for chunk in _chunk(group, self._batch_size):
+                with self._driver.session(database=self._database) as session:
+                    session.run(cypher, batch=chunk)
 
     def _batch_merge_edges(self, edges: list[dict[str, Any]], rel_type: str) -> None:
         """MERGE edges of a single relationship type in batches.
