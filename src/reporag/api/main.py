@@ -11,7 +11,6 @@ events. Run with: uvicorn src.reporag.api.main:app --reload
 # - Lifespan events: connect to Neo4j + Qdrant on startup, close on shutdown
 # - OpenAPI docs at /docs
 
-
 from fastapi import FastAPI
 
 app = FastAPI(
