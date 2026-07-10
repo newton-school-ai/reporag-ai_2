@@ -1,126 +1,226 @@
-"""Unit tests for embedder module."""
+"""Unit tests for the CodeEmbedder pipeline."""
 
-from unittest.mock import MagicMock, patch
+from __future__ import annotations
+
+from dataclasses import dataclass
+from unittest.mock import MagicMock
 
 import numpy as np
-import pytest
 import torch
 
-from reporag.embedding.code_embedder import CodeEmbedder
+from reporag.embedding.code_embedder import (
+    EMBEDDING_DIM,
+    CodeEmbedder,
+    _extract_text,
+    _resolve_device,
+)
+
+# -- helpers ------------------------------------------------------------
 
 
-@pytest.fixture
-def mock_tokenizer():
-    mock = MagicMock()
+class _FakeBatchEncoding(dict):
+    """Minimal stand-in for tokenizer output that supports ``.to()``."""
 
-    # Tokenizer output mock with a .to method
-    class MockBatchEncoding(dict):
-        def to(self, device):
-            return self
-
-    mock.return_value = MockBatchEncoding({"input_ids": torch.tensor([[1, 2, 3]])})
-    return mock
+    def to(self, device):
+        return self
 
 
-@pytest.fixture
-def mock_model():
-    mock = MagicMock()
-    # Mock last_hidden_state where the CLS token (index 0) has a specific representation
-    mock_outputs = MagicMock()
-    # shape: (batch_size, sequence_length, hidden_size) = (1, 3, 768)
-    mock_outputs.last_hidden_state = torch.ones((1, 3, 768)) * 2.0
-    mock.return_value = mock_outputs
-    mock.eval = MagicMock()
-    mock.to = MagicMock(return_value=mock)
-    return mock
+@dataclass
+class _FakeChunk:
+    """Simulates the real ``Chunk`` dataclass from the ingestion module."""
+
+    content: str
+    file_path: str = "test.py"
 
 
-@patch("reporag.embedding.code_embedder.AutoTokenizer.from_pretrained")
-@patch("reporag.embedding.code_embedder.AutoModel.from_pretrained")
-def test_code_embedder_initialization(
-    mock_auto_model, mock_auto_tokenizer, mock_model, mock_tokenizer
-):
-    mock_auto_tokenizer.return_value = mock_tokenizer
-    mock_auto_model.return_value = mock_model
+def _make_embedder(batch_size: int = 1) -> CodeEmbedder:
+    """Return a CodeEmbedder with mocked model/tokenizer pre-injected.
 
+    Because model loading is lazy and the imports happen inside
+    ``_ensure_loaded``, we inject fakes directly instead of patching.
+    """
+    tokenizer = MagicMock()
+    tokenizer.return_value = _FakeBatchEncoding(
+        {
+            "input_ids": torch.ones(batch_size, 5, dtype=torch.long),
+            "attention_mask": torch.ones(batch_size, 5, dtype=torch.long),
+        }
+    )
+
+    model = MagicMock()
+    outputs = MagicMock()
+    outputs.last_hidden_state = torch.randn(batch_size, 5, EMBEDDING_DIM)
+    model.return_value = outputs
+    model.eval = MagicMock()
+    model.to = MagicMock(return_value=model)
+
+    embedder = CodeEmbedder(model_name="test/model", device="cpu")
+    embedder._tokenizer = tokenizer
+    embedder._model = model
+    return embedder
+
+
+# -- _resolve_device ----------------------------------------------------
+
+
+def test_resolve_device_explicit():
+    assert _resolve_device("cpu") == torch.device("cpu")
+
+
+def test_resolve_device_auto():
+    device = _resolve_device("auto")
+    assert device in (torch.device("cpu"), torch.device("cuda"), torch.device("mps"))
+
+
+# -- _extract_text ------------------------------------------------------
+
+
+def test_extract_text_from_string():
+    assert _extract_text("def foo(): pass") == "def foo(): pass"
+
+
+def test_extract_text_from_chunk():
+    chunk = _FakeChunk(content="class Bar: pass")
+    assert _extract_text(chunk) == "class Bar: pass"
+
+
+# -- CodeEmbedder: construction -----------------------------------------
+
+
+def test_lazy_loading_does_not_load_model_at_init():
+    """Model must NOT be loaded during __init__ -- only on first embed."""
     embedder = CodeEmbedder(model_name="test/model")
-
-    assert embedder.model_name == "test/model"
-    assert embedder.tokenizer == mock_tokenizer
-    assert embedder.model == mock_model
-    mock_model.eval.assert_called_once()
-    assert embedder.device in [
-        torch.device("cpu"),
-        torch.device("cuda"),
-        torch.device("mps"),
-    ]
+    assert not embedder._loaded
+    assert embedder._model is None
+    assert embedder._tokenizer is None
 
 
-@patch("reporag.embedding.code_embedder.AutoTokenizer.from_pretrained")
-@patch("reporag.embedding.code_embedder.AutoModel.from_pretrained")
-def test_code_embedder_embed_batch(
-    mock_auto_model, mock_auto_tokenizer, mock_model, mock_tokenizer
-):
-    mock_auto_tokenizer.return_value = mock_tokenizer
-    mock_auto_model.return_value = mock_model
+# -- CodeEmbedder: embed_batch ------------------------------------------
 
-    embedder = CodeEmbedder()
 
-    code_strings = ["def foo(): pass"]
-    embeddings = embedder.embed_batch(code_strings)
+def test_embed_batch_shape_and_dtype():
+    embedder = _make_embedder(batch_size=1)
+    result = embedder.embed_batch(["def hello(): pass"])
 
-    assert isinstance(embeddings, np.ndarray)
-    assert embeddings.shape == (1, 768)
-    assert embeddings.dtype == np.float32
+    assert isinstance(result, np.ndarray)
+    assert result.shape == (1, EMBEDDING_DIM)
+    assert result.dtype == np.float32
 
-    # Verify L2 normalization
-    norms = np.linalg.norm(embeddings, axis=1)
+
+def test_embed_batch_l2_normalised():
+    embedder = _make_embedder(batch_size=3)
+    result = embedder.embed_batch(["a", "b", "c"])
+
+    norms = np.linalg.norm(result, axis=1)
     np.testing.assert_allclose(norms, 1.0, rtol=1e-5)
 
-    # Check if the cache was updated
-    assert "def foo(): pass" in embedder._cache
-    assert np.array_equal(embedder._cache["def foo(): pass"], embeddings[0])
+
+def test_embed_batch_empty():
+    embedder = CodeEmbedder(model_name="test/model")
+    result = embedder.embed_batch([])
+
+    assert result.shape == (0, EMBEDDING_DIM)
+    # Model should never have been loaded for an empty batch
+    assert not embedder._loaded
 
 
-@patch("reporag.embedding.code_embedder.AutoTokenizer.from_pretrained")
-@patch("reporag.embedding.code_embedder.AutoModel.from_pretrained")
-def test_code_embedder_caching(
-    mock_auto_model, mock_auto_tokenizer, mock_model, mock_tokenizer
-):
-    mock_auto_tokenizer.return_value = mock_tokenizer
-    mock_auto_model.return_value = mock_model
-
-    embedder = CodeEmbedder()
-
-    # First call will invoke the model
-    code_strings = ["def bar(): pass"]
-    _ = embedder.embed_batch(code_strings)
-    call_count_1 = mock_model.call_count
-
-    # Second call with the same string should hit the cache and not invoke the model
-    _ = embedder.embed_batch(code_strings)
-    call_count_2 = mock_model.call_count
-
-    assert call_count_1 == call_count_2  # Model was not called again
-
-    # Check cache limit
-    embedder.cache_size = 1
-    embedder.embed_batch(["def new(): pass"])
-    assert len(embedder._cache) == 1
-    assert "def new(): pass" in embedder._cache
-    assert "def bar(): pass" not in embedder._cache
+# -- CodeEmbedder: Chunk support ----------------------------------------
 
 
-@patch("reporag.embedding.code_embedder.AutoTokenizer.from_pretrained")
-@patch("reporag.embedding.code_embedder.AutoModel.from_pretrained")
-def test_code_embedder_empty_batch(
-    mock_auto_model, mock_auto_tokenizer, mock_model, mock_tokenizer
-):
-    mock_auto_tokenizer.return_value = mock_tokenizer
-    mock_auto_model.return_value = mock_model
+def test_embed_batch_accepts_chunk_objects():
+    embedder = _make_embedder(batch_size=2)
+    chunks = [
+        _FakeChunk(content="def add(a, b): return a+b"),
+        _FakeChunk(content="class Dog: pass"),
+    ]
+    result = embedder.embed_batch(chunks)
 
-    embedder = CodeEmbedder()
-    embeddings = embedder.embed_batch([])
+    assert result.shape == (2, EMBEDDING_DIM)
 
-    assert isinstance(embeddings, np.ndarray)
-    assert embeddings.shape == (0, 768)
+
+# -- CodeEmbedder: caching ---------------------------------------------
+
+
+def test_cache_prevents_recomputation():
+    embedder = _make_embedder(batch_size=1)
+    model = embedder._model
+
+    first = embedder.embed_batch(["def f(): pass"])
+    calls_after_first = model.call_count
+
+    second = embedder.embed_batch(["def f(): pass"])
+    calls_after_second = model.call_count
+
+    np.testing.assert_array_equal(first, second)
+    assert calls_after_first == calls_after_second
+
+
+def test_cache_stats():
+    embedder = _make_embedder(batch_size=1)
+    embedder.embed_batch(["x"])  # miss
+    embedder.embed_batch(["x"])  # hit
+
+    stats = embedder.cache_stats()
+    assert stats["hits"] == 1
+    assert stats["misses"] == 1
+    assert stats["size"] == 1
+
+
+def test_cache_eviction_respects_maxsize():
+    embedder = _make_embedder(batch_size=1)
+    embedder._cache_maxsize = 2
+
+    embedder.embed_batch(["a"])
+    embedder.embed_batch(["b"])
+    embedder.embed_batch(["c"])  # should evict "a"
+
+    assert embedder.cache_stats()["size"] == 2
+
+
+def test_clear_cache():
+    embedder = _make_embedder(batch_size=1)
+    embedder.embed_batch(["x"])
+    embedder.clear_cache()
+
+    stats = embedder.cache_stats()
+    assert stats == {"hits": 0, "misses": 0, "size": 0}
+
+
+# -- CodeEmbedder: deduplication ----------------------------------------
+
+
+def test_duplicates_in_batch_computed_once():
+    """If the same string appears 3x in one batch, the model sees it only once."""
+    embedder = _make_embedder(batch_size=1)
+    model = embedder._model
+
+    result = embedder.embed_batch(["dup", "dup", "dup"])
+
+    assert result.shape == (3, EMBEDDING_DIM)
+    # All three rows should be identical
+    np.testing.assert_array_equal(result[0], result[1])
+    np.testing.assert_array_equal(result[1], result[2])
+    # Model forward pass called only once (1 unique text)
+    assert model.call_count == 1
+
+
+# -- CodeEmbedder: single embed helper ---------------------------------
+
+
+def test_embed_single():
+    embedder = _make_embedder(batch_size=1)
+    vec = embedder.embed("def g(): return 1")
+
+    assert vec.shape == (EMBEDDING_DIM,)
+    assert abs(np.linalg.norm(vec) - 1.0) < 1e-5
+
+
+# -- CodeEmbedder: similarity helper -----------------------------------
+
+
+def test_similarity_returns_float():
+    embedder = _make_embedder(batch_size=2)
+    score = embedder.similarity("def a(): pass", "def b(): pass")
+
+    assert isinstance(score, float)
+    assert -1.0 <= score <= 1.0
