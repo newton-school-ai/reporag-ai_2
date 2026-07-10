@@ -42,7 +42,9 @@ class CodeEmbedder:
         self.model.eval()
 
         self.cache_size = cache_size
-        self._cache: collections.OrderedDict[str, np.ndarray] = collections.OrderedDict()
+        self._cache: collections.OrderedDict[str, np.ndarray] = (
+            collections.OrderedDict()
+        )
 
     def _get_device(self) -> torch.device:
         """Determine the best available device."""
