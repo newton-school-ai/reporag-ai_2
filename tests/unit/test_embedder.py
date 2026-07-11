@@ -236,14 +236,30 @@ def test_resolve_device_explicit_cpu():
     assert _resolve_device("cpu") == torch.device("cpu")
 
 
-def test_resolve_device_explicit_cuda():
-    """Explicit 'cuda' returns cuda device without probing availability."""
+def test_resolve_device_explicit_cuda_available(monkeypatch):
+    """Explicit 'cuda' returns cuda when CUDA is available."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     assert _resolve_device("cuda") == torch.device("cuda")
 
 
-def test_resolve_device_explicit_mps():
-    """Explicit 'mps' returns mps device without probing availability."""
+def test_resolve_device_explicit_cuda_unavailable_falls_back(monkeypatch):
+    """Explicit 'cuda' falls back to cpu when CUDA is not available."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    assert _resolve_device("cuda") == torch.device("cpu")
+
+
+def test_resolve_device_explicit_mps_available(monkeypatch):
+    """Explicit 'mps' returns mps when MPS is available."""
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
     assert _resolve_device("mps") == torch.device("mps")
+
+
+def test_resolve_device_explicit_mps_unavailable_falls_back(monkeypatch):
+    """Explicit 'mps' falls back to cpu when MPS is not available."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    assert _resolve_device("mps") == torch.device("cpu")
 
 
 def test_resolve_device_auto_prefers_cuda(monkeypatch):

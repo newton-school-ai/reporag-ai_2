@@ -40,14 +40,15 @@ EMBEDDING_DIM = 768
 def _resolve_device(preference: str = "auto") -> torch.device:
     """Pick the best available accelerator.
 
-    Resolution order: CUDA -> MPS (Apple Silicon) -> CPU.  Passing an explicit
-    device name (``"cpu"``, ``"cuda"``, ``"mps"``) skips auto-detection.
+    Resolution order for ``"auto"``: CUDA -> MPS (Apple Silicon) -> CPU.
+
+    An explicit ``"cuda"`` or ``"mps"`` request is honoured only when that
+    backend is actually available; otherwise it falls back to CPU so the
+    embedder never crashes on a machine without a GPU.
     """
-    if preference != "auto":
-        return torch.device(preference)
-    if torch.cuda.is_available():
+    if preference in ("cuda", "auto") and torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
+    if preference in ("mps", "auto") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
 
