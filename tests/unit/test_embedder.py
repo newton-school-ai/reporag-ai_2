@@ -14,6 +14,7 @@ from reporag.embedding.code_embedder import (
     _extract_text,
     _resolve_device,
 )
+from reporag.embedding.doc_embedder import DocEmbedder
 
 # -- helpers ------------------------------------------------------------
 
@@ -503,3 +504,223 @@ def test_clear_cache_forces_recomputation():
     assert stats["hits"] == 0
     assert stats["misses"] == 1
     assert stats["size"] == 1
+
+
+# -- DocEmbedder tests --------------------------------------------------
+
+
+@dataclass
+class _FakeDocItem:
+    symbol_id: str
+    content: str
+
+
+def _make_doc_embedder(batch_size: int = 1) -> DocEmbedder:
+    model = MagicMock()
+
+    def mock_encode(texts, **kwargs):
+        return np.zeros((len(texts), 384), dtype=np.float32)
+
+    model.encode.side_effect = mock_encode
+    model.device = torch.device("cpu")
+
+    embedder = DocEmbedder(
+        model_name="test/doc-model", device="cpu", batch_size=batch_size
+    )
+    embedder._model = model
+    return embedder
+
+
+def test_doc_embedder_lazy_loading():
+    embedder = DocEmbedder(model_name="test/doc-model")
+    assert embedder._model is None
+
+
+def test_doc_embedder_batch():
+    embedder = _make_doc_embedder(batch_size=2)
+    items = [
+        _FakeDocItem(symbol_id="sym1", content="Docstring 1"),
+        _FakeDocItem(symbol_id="sym2", content="Docstring 2"),
+    ]
+    results = embedder.embed_batch(items)
+    assert len(results) == 2
+    assert results[0].symbol_id == "sym1"
+    assert results[1].symbol_id == "sym2"
+    assert results[0].vector.shape == (384,)
+
+
+def test_doc_embedder_skips_empty():
+    embedder = _make_doc_embedder(batch_size=1)
+    items = [
+        _FakeDocItem(symbol_id="sym1", content="   "),
+        _FakeDocItem(symbol_id="sym2", content=""),
+        _FakeDocItem(symbol_id="sym3", content="Valid docstring"),
+    ]
+    results = embedder.embed_batch(items)
+    # The mock encode is configured for batch_size=1, which matches the 1 valid item
+    assert len(results) == 1
+    assert results[0].symbol_id == "sym3"
+
+
+def test_doc_embedder_progress_callback():
+    embedder = _make_doc_embedder(batch_size=1)
+    items = [
+        _FakeDocItem(symbol_id="sym1", content="doc 1"),
+        _FakeDocItem(symbol_id="sym2", content="doc 2"),
+    ]
+
+    progress_calls = []
+
+    def callback(processed: int, total: int):
+        progress_calls.append((processed, total))
+
+    embedder.embed_batch(items, progress_callback=callback)
+
+    # Since batch size is 1, it should process 1 by 1 and call callback twice.
+    # total valid items = 2
+    # mock encode returns 1 item per call. But  `encode` in mock always returns (batch_size, 384),
+    # which is (1, 384) here.
+    assert progress_calls == [(1, 2), (2, 2)]
+
+
+def test_doc_embedder_empty_input():
+    embedder = _make_doc_embedder(batch_size=1)
+
+    results = embedder.embed_batch([])
+    assert results == []
+
+
+def test_doc_embedder_empty_input_progress_callback():
+    embedder = _make_doc_embedder(batch_size=1)
+
+    progress_calls = []
+
+    def callback(processed: int, total: int):
+        progress_calls.append((processed, total))
+
+    embedder.embed_batch([], progress_callback=callback)
+    assert progress_calls == [(0, 0)]
+
+
+def test_doc_embedder_dict_input():
+    embedder = _make_doc_embedder(batch_size=1)
+    items = [{"symbol_id": "sym1", "content": "hello"}]
+
+    results = embedder.embed_batch(items)
+    assert len(results) == 1
+    assert results[0].symbol_id == "sym1"
+    assert results[0].vector.shape == (384,)
+    assert results[0].vector.dtype == np.float32
+
+
+def test_doc_embedder_text_field_duck_typing():
+    @dataclass
+    class _TextItem:
+        symbol_id: str
+        text: str
+
+    embedder = _make_doc_embedder(batch_size=1)
+    items = [_TextItem(symbol_id="sym1", text="a docstring via text field")]
+
+    results = embedder.embed_batch(items)
+    assert len(results) == 1
+    assert results[0].symbol_id == "sym1"
+
+
+def test_doc_embedder_id_field_duck_typing():
+    @dataclass
+    class _IdItem:
+        id: str
+        content: str
+
+    embedder = _make_doc_embedder(batch_size=1)
+    items = [_IdItem(id="sym1", content="a docstring via id field")]
+
+    results = embedder.embed_batch(items)
+    assert len(results) == 1
+    assert results[0].symbol_id == "sym1"
+
+
+def test_doc_embedder_mixed_valid_and_invalid():
+    embedder = _make_doc_embedder(batch_size=1)
+    items = [
+        {"content": "missing symbol id"},  # no symbol_id/id key -> filtered
+        _FakeDocItem(symbol_id="sym2", content=""),  # empty content -> filtered
+        _FakeDocItem(symbol_id="sym3", content="   "),  # whitespace -> filtered
+        _FakeDocItem(symbol_id="sym4", content="valid docstring"),  # valid
+    ]
+
+    results = embedder.embed_batch(items)
+    assert len(results) == 1
+    assert results[0].symbol_id == "sym4"
+
+
+def test_doc_embedder_multiple_batches():
+    embedder = _make_doc_embedder(batch_size=2)
+    items = [_FakeDocItem(symbol_id=f"sym{i}", content=f"doc {i}") for i in range(1, 6)]
+
+    results = embedder.embed_batch(items)
+    assert len(results) == 5
+    assert [r.symbol_id for r in results] == [f"sym{i}" for i in range(1, 6)]
+    # 5 items at batch_size=2 -> batches of 2, 2, 1
+    assert embedder._model.encode.call_count == 3
+
+
+# -- Device resolution tests ---------------------------------------------
+
+
+def test_doc_embedder_device_auto_prefers_cuda(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+
+    embedder = DocEmbedder(model_name="test/doc-model", device="auto")
+    assert str(embedder.device) == "cuda"
+
+
+def test_doc_embedder_device_auto_falls_back_to_mps(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+
+    embedder = DocEmbedder(model_name="test/doc-model", device="auto")
+    assert str(embedder.device) == "mps"
+
+
+def test_doc_embedder_device_auto_falls_back_to_cpu(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+
+    embedder = DocEmbedder(model_name="test/doc-model", device="auto")
+    assert str(embedder.device) == "cpu"
+
+
+def test_doc_embedder_device_explicit_cpu_ignores_availability(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+
+    embedder = DocEmbedder(model_name="test/doc-model", device="cpu")
+    assert str(embedder.device) == "cpu"
+
+
+def test_doc_embedder_progress_callback_multiple_batches():
+    embedder = _make_doc_embedder(batch_size=2)
+
+    items = [_FakeDocItem(symbol_id=f"sym{i}", content=f"doc {i}") for i in range(5)]
+
+    calls = []
+
+    embedder.embed_batch(
+        items,
+        progress_callback=lambda done, total: calls.append((done, total)),
+    )
+
+    assert calls == [(2, 5), (4, 5), (5, 5)]
+
+
+def test_doc_embedder_batch_size_override():
+    embedder = _make_doc_embedder(batch_size=10)
+
+    items = [_FakeDocItem(symbol_id=f"sym{i}", content=f"doc {i}") for i in range(5)]
+
+    embedder.embed_batch(items, batch_size=2)
+
+    assert embedder._model.encode.call_count == 3
