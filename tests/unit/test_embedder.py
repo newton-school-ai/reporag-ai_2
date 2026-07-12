@@ -14,6 +14,12 @@ from reporag.embedding.code_embedder import (
     _extract_text,
     _resolve_device,
 )
+from reporag.embedding.doc_embedder import (
+    DOC_EMBEDDING_DIM,
+    DocEmbedder,
+    DocEmbeddingResult,
+    DocSymbol,
+)
 
 # -- helpers ------------------------------------------------------------
 
@@ -503,3 +509,286 @@ def test_clear_cache_forces_recomputation():
     assert stats["hits"] == 0
     assert stats["misses"] == 1
     assert stats["size"] == 1
+
+
+# =========================================================================
+# DocEmbedder tests
+# =========================================================================
+
+
+# -- helpers for DocEmbedder ------------------------------------------------
+
+
+def _make_doc_embedder(batch_size: int = 1) -> DocEmbedder:
+    """Return a DocEmbedder with mocked model/tokenizer pre-injected.
+
+    Uses DOC_EMBEDDING_DIM (384) for the hidden state so output shapes
+    match the real model.
+    """
+    tokenizer = MagicMock()
+    tokenizer.return_value = _FakeBatchEncoding(
+        {
+            "input_ids": torch.ones(batch_size, 5, dtype=torch.long),
+            "attention_mask": torch.ones(batch_size, 5, dtype=torch.long),
+        }
+    )
+
+    model = MagicMock()
+    outputs = MagicMock()
+    outputs.last_hidden_state = torch.randn(batch_size, 5, DOC_EMBEDDING_DIM)
+    model.return_value = outputs
+    model.eval = MagicMock()
+    model.to = MagicMock(return_value=model)
+
+    embedder = DocEmbedder(model_name="test/doc-model", device="cpu")
+    embedder._tokenizer = tokenizer
+    embedder._model = model
+    return embedder
+
+
+def _make_counting_doc_embedder(total_items: int, batch_size: int) -> DocEmbedder:
+    """Return a DocEmbedder whose mock model tracks per-call batch sizes."""
+    call_sizes: list[int] = []
+
+    tokenizer = MagicMock()
+
+    def fake_tokenize(texts, **kwargs):
+        n = len(texts)
+        call_sizes.append(n)
+        return _FakeBatchEncoding(
+            {
+                "input_ids": torch.ones(n, 5, dtype=torch.long),
+                "attention_mask": torch.ones(n, 5, dtype=torch.long),
+            }
+        )
+
+    tokenizer.side_effect = fake_tokenize
+
+    model = MagicMock()
+
+    def fake_forward(**kwargs):
+        n = kwargs["input_ids"].shape[0]
+        out = MagicMock()
+        out.last_hidden_state = torch.randn(n, 5, DOC_EMBEDDING_DIM)
+        return out
+
+    model.side_effect = fake_forward
+    model.eval = MagicMock()
+    model.to = MagicMock(return_value=model)
+
+    embedder = DocEmbedder(
+        model_name="test/doc-model", device="cpu", batch_size=batch_size
+    )
+    embedder._tokenizer = tokenizer
+    embedder._model = model
+    embedder._call_sizes = call_sizes  # expose for assertions
+    return embedder
+
+
+# -- DocEmbedder: construction ---------------------------------------------
+
+
+def test_doc_embedder_lazy_loading():
+    """Model must NOT be loaded during __init__ -- only on first embed."""
+    embedder = DocEmbedder(model_name="test/doc-model")
+    assert not embedder._loaded
+    assert embedder._model is None
+    assert embedder._tokenizer is None
+
+
+# -- DocEmbedder: embed_batch ----------------------------------------------
+
+
+def test_doc_embed_batch_shape_and_dtype():
+    embedder = _make_doc_embedder(batch_size=1)
+    result = embedder.embed_batch(["Authenticate user with JWT token"])
+
+    assert isinstance(result, np.ndarray)
+    assert result.shape == (1, DOC_EMBEDDING_DIM)
+    assert result.dtype == np.float32
+
+
+def test_doc_embed_batch_l2_normalised():
+    embedder = _make_doc_embedder(batch_size=3)
+    result = embedder.embed_batch(["a", "b", "c"])
+
+    norms = np.linalg.norm(result, axis=1)
+    np.testing.assert_allclose(norms, 1.0, rtol=1e-5)
+
+
+def test_doc_embed_batch_empty_list():
+    embedder = DocEmbedder(model_name="test/doc-model")
+    result = embedder.embed_batch([])
+
+    assert result.shape == (0, DOC_EMBEDDING_DIM)
+    # Model should never have been loaded for an empty batch
+    assert not embedder._loaded
+
+
+# -- DocEmbedder: empty-string handling ------------------------------------
+
+
+def test_doc_embed_batch_skips_empty_strings():
+    """Empty and whitespace-only strings produce zero vectors without model call."""
+    embedder = _make_doc_embedder(batch_size=1)
+    model = embedder._model
+
+    result = embedder.embed_batch(["", "   ", "\t\n"])
+
+    assert result.shape == (3, DOC_EMBEDDING_DIM)
+    # All rows should be zero vectors
+    for i in range(3):
+        np.testing.assert_array_equal(result[i], np.zeros(DOC_EMBEDDING_DIM))
+    # Model forward pass should never have been called
+    assert model.call_count == 0
+
+
+def test_doc_embed_batch_mixed_empty_and_nonempty():
+    """Empty strings get zero vectors; non-empty strings get real embeddings."""
+    embedder = _make_counting_doc_embedder(total_items=1, batch_size=2)
+    result = embedder.embed_batch(["", "valid docstring", "   "])
+
+    assert result.shape == (3, DOC_EMBEDDING_DIM)
+    # Row 0 and 2 should be zero
+    np.testing.assert_array_equal(result[0], np.zeros(DOC_EMBEDDING_DIM))
+    np.testing.assert_array_equal(result[2], np.zeros(DOC_EMBEDDING_DIM))
+    # Row 1 should be a real (non-zero, normalised) vector
+    assert np.linalg.norm(result[1]) > 0
+
+
+# -- DocEmbedder: single embed helper -------------------------------------
+
+
+def test_doc_embed_single():
+    embedder = _make_doc_embedder(batch_size=1)
+    vec = embedder.embed("Parse request body as JSON")
+
+    assert vec.shape == (DOC_EMBEDDING_DIM,)
+    assert abs(np.linalg.norm(vec) - 1.0) < 1e-5
+
+
+# -- DocEmbedder: symbol linking -------------------------------------------
+
+
+def test_doc_embed_symbols():
+    """embed_symbols() returns DocEmbeddingResult with correct symbol linkage."""
+    embedder = _make_doc_embedder(batch_size=2)
+    symbols = [
+        DocSymbol(symbol_id="func_123", text="Authenticate user with JWT token"),
+        DocSymbol(symbol_id="class_456", text="Database connection pool"),
+    ]
+
+    results = embedder.embed_symbols(symbols)
+
+    assert len(results) == 2
+    assert all(isinstance(r, DocEmbeddingResult) for r in results)
+    assert results[0].symbol_id == "func_123"
+    assert results[0].text == "Authenticate user with JWT token"
+    assert results[0].vector.shape == (DOC_EMBEDDING_DIM,)
+    assert results[1].symbol_id == "class_456"
+    assert results[1].text == "Database connection pool"
+    assert results[1].vector.shape == (DOC_EMBEDDING_DIM,)
+
+
+def test_doc_embed_symbols_skips_empty_text():
+    """embed_symbols() with empty text still returns the symbol but with zero vector."""
+    embedder = _make_doc_embedder(batch_size=1)
+    symbols = [DocSymbol(symbol_id="empty_sym", text="")]
+
+    results = embedder.embed_symbols(symbols)
+
+    assert len(results) == 1
+    assert results[0].symbol_id == "empty_sym"
+    np.testing.assert_array_equal(results[0].vector, np.zeros(DOC_EMBEDDING_DIM))
+
+
+# -- DocEmbedder: caching -------------------------------------------------
+
+
+def test_doc_cache_prevents_recomputation():
+    embedder = _make_doc_embedder(batch_size=1)
+    model = embedder._model
+
+    first = embedder.embed_batch(["verify JWT token"])
+    calls_after_first = model.call_count
+
+    second = embedder.embed_batch(["verify JWT token"])
+    calls_after_second = model.call_count
+
+    np.testing.assert_array_equal(first, second)
+    assert calls_after_first == calls_after_second
+
+
+def test_doc_cache_stats():
+    embedder = _make_doc_embedder(batch_size=1)
+    embedder.embed_batch(["x"])  # miss
+    embedder.embed_batch(["x"])  # hit
+
+    stats = embedder.cache_stats()
+    assert stats["hits"] == 1
+    assert stats["misses"] == 1
+    assert stats["size"] == 1
+
+
+# -- DocEmbedder: deduplication -------------------------------------------
+
+
+def test_doc_duplicates_in_batch_computed_once():
+    """If the same string appears 3x in one batch, the model sees it only once."""
+    embedder = _make_doc_embedder(batch_size=1)
+    model = embedder._model
+
+    result = embedder.embed_batch(["dup", "dup", "dup"])
+
+    assert result.shape == (3, DOC_EMBEDDING_DIM)
+    np.testing.assert_array_equal(result[0], result[1])
+    np.testing.assert_array_equal(result[1], result[2])
+    assert model.call_count == 1
+
+
+# -- DocEmbedder: similarity helper ----------------------------------------
+
+
+def test_doc_similarity_returns_float():
+    embedder = _make_doc_embedder(batch_size=2)
+    score = embedder.similarity("authentication", "verify JWT token")
+
+    assert isinstance(score, float)
+    assert -1.0 <= score <= 1.0
+
+
+# -- DocEmbedder: progress callback ---------------------------------------
+
+
+def test_doc_progress_callback():
+    """on_progress is called with correct (completed, total) values."""
+    progress_calls: list[tuple[int, int]] = []
+
+    def on_progress(completed: int, total: int) -> None:
+        progress_calls.append((completed, total))
+
+    embedder = _make_counting_doc_embedder(total_items=3, batch_size=2)
+    embedder.embed_batch(["a", "b", "c"], on_progress=on_progress)
+
+    # 3 unique items, batch_size=2 -> 2 mini-batches -> 2 progress calls
+    assert len(progress_calls) == 2
+    # Final call should report all items completed
+    assert progress_calls[-1] == (3, 3)
+    # Each call's total should be the full count
+    assert all(total == 3 for _, total in progress_calls)
+
+
+def test_doc_progress_callback_all_cached():
+    """on_progress fires once with (total, total) when everything is cached."""
+    progress_calls: list[tuple[int, int]] = []
+
+    def on_progress(completed: int, total: int) -> None:
+        progress_calls.append((completed, total))
+
+    embedder = _make_doc_embedder(batch_size=1)
+    embedder.embed_batch(["cached text"])  # prime cache
+
+    embedder.embed_batch(["cached text"], on_progress=on_progress)
+
+    assert len(progress_calls) == 1
+    assert progress_calls[0] == (1, 1)
