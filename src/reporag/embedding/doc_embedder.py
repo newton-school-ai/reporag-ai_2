@@ -318,6 +318,69 @@ class DocEmbedder:
             for sym, vec in zip(symbols, vectors, strict=True)
         ]
 
+    def embed_records(
+        self,
+        records: Sequence[Any],
+        *,
+        batch_size: int | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
+        include_signature: bool = False,
+    ) -> list[DocEmbeddingResult]:
+        """Embed docstrings directly from symbol records, skipping empty ones.
+
+        Duck-types the input items: looks for ``docstring``, ``signature``,
+        and ``symbol_id`` attributes (so it accepts
+        :class:`~src.reporag.graph.symbol_table.SymbolRecord`).
+
+        Records missing a docstring, or with an empty/whitespace-only docstring,
+        are safely filtered out and do not appear in the results.
+
+        Args:
+            records: A sequence of objects (like ``SymbolRecord``) with a
+                ``docstring`` and ``symbol_id``.
+            batch_size: Override the instance default for this call.
+            on_progress: Optional callback ``(completed, total)`` invoked
+                after each mini-batch finishes.
+            include_signature: If True, the ``signature`` (if present) is
+                prepended to the docstring text before embedding. This gives
+                the model crucial semantic context.
+
+        Returns:
+            A list of :class:`DocEmbeddingResult`, one per valid record.
+        """
+        valid_records = []
+        valid_texts = []
+        for r in records:
+            docstring = getattr(r, "docstring", None)
+            if docstring and isinstance(docstring, str) and docstring.strip():
+                text = docstring.strip()
+                if include_signature:
+                    sig = getattr(r, "signature", None)
+                    if sig and isinstance(sig, str) and sig.strip():
+                        text = f"{sig.strip()}\n{text}"
+                valid_records.append(r)
+                valid_texts.append(text)
+
+        if not valid_records:
+            return []
+
+        vectors = self.embed_batch(
+            valid_texts,
+            batch_size=batch_size,
+            on_progress=on_progress,
+        )
+
+        embeddings = []
+        for record, text, vec in zip(valid_records, valid_texts, vectors, strict=True):
+            embeddings.append(
+                DocEmbeddingResult(
+                    symbol_id=getattr(record, "symbol_id", ""),
+                    text=text,
+                    vector=vec,
+                )
+            )
+        return embeddings
+
     def similarity(self, a: str, b: str) -> float:
         """Cosine similarity between two text inputs.
 

@@ -702,6 +702,71 @@ def test_doc_embed_symbols_skips_empty_text():
     np.testing.assert_array_equal(results[0].vector, np.zeros(DOC_EMBEDDING_DIM))
 
 
+# -- DocEmbedder: embed_records (SymbolRecord duck-typing) -----------------
+
+
+@dataclass
+class _FakeSymbolRecord:
+    symbol_id: str
+    docstring: str | None = None
+    signature: str | None = None
+
+
+def test_doc_embed_records_extracts_docstrings():
+    """embed_records() extracts .docstring automatically and maps it to text."""
+    embedder = _make_doc_embedder(batch_size=2)
+    records = [
+        _FakeSymbolRecord(symbol_id="r1", docstring="Valid doc 1"),
+        _FakeSymbolRecord(symbol_id="r2", docstring="Valid doc 2"),
+    ]
+
+    results = embedder.embed_records(records)
+
+    assert len(results) == 2
+    assert results[0].symbol_id == "r1"
+    assert results[0].text == "Valid doc 1"
+    assert results[0].vector.shape == (DOC_EMBEDDING_DIM,)
+    assert results[1].symbol_id == "r2"
+    assert results[1].text == "Valid doc 2"
+    assert results[1].vector.shape == (DOC_EMBEDDING_DIM,)
+
+
+def test_doc_embed_records_with_signature():
+    """include_signature=True prepends the signature to the docstring."""
+    embedder = _make_doc_embedder(batch_size=1)
+    records = [
+        _FakeSymbolRecord(
+            symbol_id="func1",
+            docstring="Adds two numbers",
+            signature="def add(a: int, b: int) -> int:",
+        )
+    ]
+
+    results = embedder.embed_records(records, include_signature=True)
+
+    assert len(results) == 1
+    assert results[0].symbol_id == "func1"
+    assert results[0].text == "def add(a: int, b: int) -> int:\nAdds two numbers"
+    assert results[0].vector.shape == (DOC_EMBEDDING_DIM,)
+
+
+def test_doc_embed_records_skips_empty():
+    """Records with missing or empty docstrings are entirely omitted from output."""
+    embedder = _make_doc_embedder(batch_size=1)
+    records = [
+        _FakeSymbolRecord(symbol_id="r1", docstring=None),  # no docstring
+        _FakeSymbolRecord(symbol_id="r2", docstring="   \n"),  # whitespace only
+        _FakeSymbolRecord(symbol_id="r3", docstring="I am valid"),
+    ]
+
+    results = embedder.embed_records(records)
+
+    assert len(results) == 1
+    assert results[0].symbol_id == "r3"
+    assert results[0].text == "I am valid"
+    assert results[0].vector.shape == (DOC_EMBEDDING_DIM,)
+
+
 # -- DocEmbedder: caching -------------------------------------------------
 
 
