@@ -198,14 +198,19 @@ def test_language_filtering(vector_searcher: VectorSearch) -> None:
 
 def test_glob_file_path_filtering(vector_searcher: VectorSearch) -> None:
     """Verify glob pattern file path matching works correctly."""
-    # Glob matching all files in src/
+    # Glob matching all Python files in src/
     results_src = vector_searcher.search("format", file_path="src/*.py")
     assert len(results_src) == 1
     assert results_src[0].file_path == "src/utils.py"
 
-    # Glob that matches nothing
-    results_none = vector_searcher.search("format", file_path="static/**/*.py")
+    # Glob that matches nothing (no Python files in static/)
+    results_none = vector_searcher.search("format", file_path="static/*.py")
     assert len(results_none) == 0
+
+    # Glob matching JavaScript files
+    results_js = vector_searcher.search("render", file_path="static/*.js")
+    assert len(results_js) == 1
+    assert results_js[0].file_path == "static/app.js"
 
 
 def test_symbol_type_filtering(vector_searcher: VectorSearch) -> None:
@@ -246,3 +251,27 @@ def test_top_k_limit(vector_searcher: VectorSearch) -> None:
 
     results = vector_searcher.search("auth", top_k=3)
     assert len(results) == 3
+
+
+def test_top_k_zero_raises(vector_searcher: VectorSearch) -> None:
+    """Verify that top_k < 1 raises a ValueError immediately."""
+    with pytest.raises(ValueError, match="top_k"):
+        vector_searcher.search("auth", top_k=0)
+
+
+def test_both_collections_fail_raises_runtime_error() -> None:
+    """Verify RuntimeError is raised when both Qdrant searches fail."""
+
+    class _AlwaysFailClient:
+        def search(self, **_kwargs: object) -> None:
+            raise ConnectionError("Qdrant unreachable")
+
+    searcher = VectorSearch(
+        client=_AlwaysFailClient(),
+        code_embedder=MockCodeEmbedder(),
+        doc_embedder=MockDocEmbedder(),
+        collection_code="reporag_code",
+        collection_docs="reporag_docs",
+    )
+    with pytest.raises(RuntimeError, match="Both vector searches failed"):
+        searcher.search("auth", top_k=5)
