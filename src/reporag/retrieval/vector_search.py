@@ -12,13 +12,15 @@ import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from qdrant_client.models import FieldCondition, Filter, MatchValue
+if TYPE_CHECKING:
+    from qdrant_client.models import Filter
+
+    from reporag.embedding.code_embedder import CodeEmbedder
+    from reporag.embedding.doc_embedder import DocEmbedder
 
 from reporag.config import settings
-from reporag.embedding.code_embedder import CodeEmbedder
-from reporag.embedding.doc_embedder import DocEmbedder
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +92,18 @@ class VectorSearch:
         self.qdrant_url = qdrant_url or settings.qdrant_url
         self.collection_code = collection_code or settings.qdrant_collection_code
         self.collection_docs = collection_docs or settings.qdrant_collection_docs
-        self.code_embedder = code_embedder or CodeEmbedder()
-        self.doc_embedder = doc_embedder or DocEmbedder()
+        if code_embedder is None:
+            from reporag.embedding.code_embedder import CodeEmbedder
+
+            code_embedder = CodeEmbedder()
+        self.code_embedder = code_embedder
+
+        if doc_embedder is None:
+            from reporag.embedding.doc_embedder import DocEmbedder
+
+            doc_embedder = DocEmbedder()
+        self.doc_embedder = doc_embedder
+
         self._glob_candidate_multiplier = glob_candidate_multiplier
 
     @property
@@ -121,6 +133,8 @@ class VectorSearch:
         file_path_exact: str | None,
     ) -> Filter | None:
         """Build a Qdrant filter for the code collection."""
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
         must = []
         if language:
             must.append(
@@ -147,6 +161,8 @@ class VectorSearch:
         Symbol-type filtering uses the nested key ``metadata.symbol_type`` because
         :class:`~reporag.embedding.doc_embedder.DocEmbedder` stores it there.
         """
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
         must = []
         if language:
             must.append(
@@ -331,10 +347,17 @@ class VectorSearch:
         doc_results = [self._point_to_doc_result(p) for p in doc_points]
 
         # Python-side score threshold guard (protects against fakes/mocks that
-        # ignore the score_threshold param in client.search)
+        # ignore the score_threshold param in client.search).
+        # To match the docstring, thresholds are inclusive (>=), but the default
+        # threshold of 0.0 uses strict (>) comparison to exclude orthogonal (0.0)
+        # and negative matches.
         if score_threshold is not None:
-            code_results = [r for r in code_results if r.score > score_threshold]
-            doc_results = [r for r in doc_results if r.score > score_threshold]
+            if score_threshold == 0.0:
+                code_results = [r for r in code_results if r.score > 0.0]
+                doc_results = [r for r in doc_results if r.score > 0.0]
+            else:
+                code_results = [r for r in code_results if r.score >= score_threshold]
+                doc_results = [r for r in doc_results if r.score >= score_threshold]
 
         # Python-side glob filter (Qdrant has no native wildcard support)
         if glob_pattern:
@@ -348,6 +371,33 @@ class VectorSearch:
                 for r in doc_results
                 if r.file_path and fnmatch.fnmatchcase(r.file_path, glob_pattern)
             ]
+
+        # Python-side symbol_type guard for doc results.
+        #
+        # The doc collection stores symbol_type inside a nested ``metadata``
+        # sub-dict (key path ``metadata.symbol_type``) because
+        # :class:`~reporag.embedding.doc_embedder.DocEmbedder` puts it there.
+        # Qdrant's nested-key filter syntax is not supported by the in-memory
+        # client used in tests and is unreliable across older server versions,
+        # so we always apply the filter here in Python as well.  For code
+        # results the Qdrant-side filter already operated on the top-level
+        # ``symbol_type`` key, so no second pass is needed there.
+        if symbol_type:
+
+            def _doc_symbol_type(r: RetrievalResult) -> str | None:
+                """Safely extract symbol_type from a doc result's nested metadata.
+
+                DocEmbedder stores ``symbol_type`` inside a sub-dict under the
+                key ``"metadata"`` (e.g. ``payload["metadata"]["symbol_type"]``).
+                Guard against malformed payloads where that sub-value might be
+                ``None`` or a non-dict type so we never raise ``AttributeError``.
+                """
+                sub = r.metadata.get("metadata")
+                if not isinstance(sub, dict):
+                    return None
+                return sub.get("symbol_type")
+
+            doc_results = [r for r in doc_results if _doc_symbol_type(r) == symbol_type]
 
         # Merge and deduplicate: same (file, start, end) -> keep higher score
         seen: dict[tuple[str, int | None, int | None], RetrievalResult] = {}
