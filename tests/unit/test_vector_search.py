@@ -146,8 +146,8 @@ class TestRetrievalResult:
             end_line=10,
         )
         assert r.source == "vector_code"
-        assert r.symbol_name is None
-        assert r.chunk_text == ""
+        assert r.symbol is None
+        assert r.content == ""
         assert r.metadata == {}
         assert r.point_id is None
 
@@ -157,8 +157,8 @@ class TestRetrievalResult:
             file_path="src/db.py",
             start_line=5,
             end_line=20,
-            symbol_name="db.connect",
-            chunk_text="def connect(): ...",
+            symbol="db.connect",
+            content="def connect(): ...",
             source="bm25",
             point_id="abc-123",
             metadata={"language": "python"},
@@ -498,11 +498,19 @@ class TestSearch:
         assert scores == sorted(scores, reverse=True)
 
     def test_both_embedders_called(self):
-        """Combined search must use BOTH embedders (one per collection)."""
+        """Combined search must use BOTH embedders if no symbol_type filter."""
         vs = _make_search()
         vs.search("test query", top_k=5)
         vs.code_embedder.embed.assert_called_once_with("test query")
         vs.doc_embedder.embed.assert_called_once_with("test query")
+
+    def test_symbol_type_skips_doc_search(self):
+        """If symbol_type filter is present, docs collection is skipped entirely."""
+        vs = _make_search()
+        vs.search("test query", top_k=5, symbol_type="function")
+        vs.code_embedder.embed.assert_called_once_with("test query")
+        # Should NOT embed or search for docs if symbol_type is provided
+        vs.doc_embedder.embed.assert_not_called()
 
     def test_partial_qdrant_failure_returns_surviving_results(self):
         """If one collection fails, results from the other still return."""

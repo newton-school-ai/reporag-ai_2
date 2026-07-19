@@ -73,9 +73,9 @@ class RetrievalResult:
         file_path:   Repository-relative path of the source file.
         start_line:  First line of the chunk (1-based).
         end_line:    Last line of the chunk (1-based, inclusive).
-        symbol_name: Qualified name of the enclosing symbol, if known
+        symbol:      Qualified name of the enclosing symbol, if known
                      (e.g. ``"reporag.api.main.health"``).
-        chunk_text:  The raw text of the chunk or documentation passage.
+        content:     The raw text of the chunk or documentation passage.
         source:      Which retriever produced this result. One of
                      ``"vector_code"``, ``"vector_doc"``, ``"bm25"``,
                      ``"graph"``.
@@ -91,14 +91,14 @@ class RetrievalResult:
     file_path: str
     start_line: int
     end_line: int
-    symbol_name: str | None = None
-    chunk_text: str = ""
+    symbol: str | None = None
+    content: str = ""
     source: str = "vector_code"
     point_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __repr__(self) -> str:  # pragma: no cover
-        sym = f" ({self.symbol_name})" if self.symbol_name else ""
+        sym = f" ({self.symbol})" if self.symbol else ""
         return (
             f"RetrievalResult(score={self.score:.4f}, "
             f"{self.file_path}:{self.start_line}-{self.end_line}{sym}, "
@@ -223,8 +223,8 @@ def _code_point_to_result(point: Any) -> RetrievalResult:
         file_path=payload.get("file_path", ""),
         start_line=int(payload.get("start_line", 0)),
         end_line=int(payload.get("end_line", 0)),
-        symbol_name=payload.get("qualified_name") or payload.get("symbol"),
-        chunk_text=payload.get("content", ""),
+        symbol=payload.get("qualified_name") or payload.get("symbol"),
+        content=payload.get("content", ""),
         source="vector_code",
         point_id=str(point.id) if point.id is not None else None,
         metadata=payload,
@@ -239,8 +239,8 @@ def _doc_point_to_result(point: Any) -> RetrievalResult:
         file_path=payload.get("file_path", ""),
         start_line=int(payload.get("start_line", 0)),
         end_line=int(payload.get("end_line", 0)),
-        symbol_name=payload.get("symbol_id"),
-        chunk_text=payload.get("text", ""),
+        symbol=payload.get("symbol_id"),
+        content=payload.get("text", ""),
         source="vector_doc",
         point_id=str(point.id) if point.id is not None else None,
         metadata=payload,
@@ -390,13 +390,17 @@ class VectorSearch:
             symbol_type=symbol_type,
             repo_id=repo_id,
         )
-        doc_results = self.search_docs(
-            query,
-            top_k=fetch_k,
-            language=language,
-            doc_type=None,
-            repo_id=repo_id,
-        )
+
+        doc_results = []
+        if symbol_type is None:
+            # Only search docs if no code-specific symbol_type filter is provided
+            doc_results = self.search_docs(
+                query,
+                top_k=fetch_k,
+                language=language,
+                doc_type=None,
+                repo_id=repo_id,
+            )
 
         merged = _merge_results(
             code_results,
