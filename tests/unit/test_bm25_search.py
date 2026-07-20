@@ -1,8 +1,8 @@
 """Unit tests for BM25 sparse keyword search.
 
 Uses a **real** BM25Index built in-memory with the real ``tokenize_code``
-tokenizer, so the full pipeline (tokenization → BM25 scoring → boosting →
-filtering → RetrievalResult) is validated end-to-end without network,
+tokenizer, so the full pipeline (tokenization -> BM25 scoring -> boosting ->
+filtering -> RetrievalResult) is validated end-to-end without network,
 GPU, or pickle files.
 
 Payload schema follows the Issue 15 / HybridIndexBuilder canonical layout:
@@ -28,7 +28,7 @@ from reporag.retrieval.vector_search import RetrievalResult
 # Each tuple is (doc_id, text_to_index, metadata_dict).
 # The text is what BM25 tokenizes; metadata is what search returns.
 _CORPUS = [
-    # Doc 1: DEFINES authenticate_user — should rank #1 for that query
+    # Doc 1: DEFINES authenticate_user -- should rank #1 for that query
     (
         "id-1",
         "def authenticate_user(username, password): validate(username) check_password(password)",
@@ -254,7 +254,7 @@ class TestFiltering:
     """All post-filters work correctly."""
 
     def test_symbol_type_filter(self, searcher: BM25Search) -> None:
-        """Filter to classes only — should exclude functions."""
+        """Filter to classes only -- should exclude functions."""
         results = searcher.search("authenticate", symbol_type="class")
         assert len(results) > 0
         for r in results:
