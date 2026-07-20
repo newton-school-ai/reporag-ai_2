@@ -16,11 +16,10 @@ from pathlib import Path
 
 import pytest
 
+from reporag.config import settings
 from reporag.embedding.index_builder import BM25Index
 from reporag.retrieval.bm25_search import BM25Search
 from reporag.retrieval.vector_search import RetrievalResult
-from reporag.config import settings
-
 
 # ---------------------------------------------------------------------------
 # Test corpus
@@ -256,9 +255,7 @@ class TestFiltering:
 
     def test_repo_id_filter(self, searcher: BM25Search):
         """Filter to a specific repo."""
-        results = searcher.search(
-            "authenticate_user", repo_id="other-org/other-repo"
-        )
+        results = searcher.search("authenticate_user", repo_id="other-org/other-repo")
         assert len(results) > 0
         for r in results:
             assert r.metadata["repo_id"] == "other-org/other-repo"
