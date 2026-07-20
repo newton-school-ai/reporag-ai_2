@@ -112,6 +112,7 @@ class BM25Search:
 
         Raises:
             RuntimeError: If no BM25 index has been loaded.
+            ValueError: If *top_k* is explicitly provided and less than 1.
 
         Note:
             There is no ``language`` filter because the BM25 index does
@@ -125,6 +126,9 @@ class BM25Search:
 
         if not query or not query.strip():
             return []
+
+        if top_k is not None and top_k < 1:
+            raise ValueError(f"top_k must be >= 1, got {top_k!r}")
 
         effective_top_k = top_k if top_k is not None else settings.bm25_search_top_k
 

@@ -129,20 +129,27 @@ def searcher(bm25_index: BM25Index) -> BM25Search:
 class TestBM25SearchBasic:
     """Edge cases and error handling."""
 
-    def test_no_index_raises(self):
+    def test_no_index_raises(self) -> None:
         """Searching without a loaded index raises RuntimeError."""
         s = BM25Search()
         with pytest.raises(RuntimeError, match="No BM25 index loaded"):
             s.search("test")
 
-    def test_empty_query_returns_empty(self, searcher: BM25Search):
+    def test_empty_query_returns_empty(self, searcher: BM25Search) -> None:
         assert searcher.search("") == []
         assert searcher.search("   ") == []
 
-    def test_no_matches_returns_empty(self, searcher: BM25Search):
+    def test_no_matches_returns_empty(self, searcher: BM25Search) -> None:
         """A query with zero lexical overlap returns nothing."""
         results = searcher.search("zzzznonexistentzzzzz")
         assert results == []
+
+    def test_invalid_top_k_raises(self, searcher: BM25Search) -> None:
+        """top_k < 1 raises ValueError, matching VectorSearch behaviour."""
+        with pytest.raises(ValueError, match="top_k must be >= 1"):
+            searcher.search("authenticate", top_k=0)
+        with pytest.raises(ValueError, match="top_k must be >= 1"):
+            searcher.search("authenticate", top_k=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -153,13 +160,13 @@ class TestBM25SearchBasic:
 class TestBM25SearchResults:
     """Result type, field alignment, and sorting."""
 
-    def test_returns_retrieval_results(self, searcher: BM25Search):
+    def test_returns_retrieval_results(self, searcher: BM25Search) -> None:
         results = searcher.search("authenticate_user")
         assert len(results) > 0
         for r in results:
             assert isinstance(r, RetrievalResult)
 
-    def test_field_mapping_matches_schema(self, searcher: BM25Search):
+    def test_field_mapping_matches_schema(self, searcher: BM25Search) -> None:
         """Verify each field maps to the correct BM25 metadata key."""
         results = searcher.search("authenticate_user")
         r = results[0]
@@ -174,12 +181,12 @@ class TestBM25SearchResults:
         assert r.chunk_text != ""
         assert isinstance(r.metadata, dict)
 
-    def test_sorted_by_score_descending(self, searcher: BM25Search):
+    def test_sorted_by_score_descending(self, searcher: BM25Search) -> None:
         results = searcher.search("authenticate", top_k=10)
         scores = [r.score for r in results]
         assert scores == sorted(scores, reverse=True)
 
-    def test_metadata_is_full_dict(self, searcher: BM25Search):
+    def test_metadata_is_full_dict(self, searcher: BM25Search) -> None:
         """The full BM25 metadata dict is passed through."""
         results = searcher.search("authenticate_user")
         meta = results[0].metadata
@@ -202,7 +209,7 @@ class TestBM25SearchResults:
 class TestNameBoosting:
     """Verify the name_boost parameter works correctly."""
 
-    def test_defining_function_ranks_first(self, searcher: BM25Search):
+    def test_defining_function_ranks_first(self, searcher: BM25Search) -> None:
         """'authenticate_user' returns the defining function as top-1,
         not a file that merely mentions it.
 
@@ -216,7 +223,7 @@ class TestNameBoosting:
         # Its symbol_name is the qualified name from BM25 metadata
         assert results[0].symbol_name == "auth.authenticate_user"
 
-    def test_boost_disabled_when_one(self, searcher: BM25Search):
+    def test_boost_disabled_when_one(self, searcher: BM25Search) -> None:
         """name_boost=1.0 effectively disables boosting (multiply by 1)."""
         boosted = searcher.search("authenticate_user", name_boost=2.0)
         unboosted = searcher.search("authenticate_user", name_boost=1.0)
@@ -227,7 +234,7 @@ class TestNameBoosting:
         # The boosted top-1 score should be >= unboosted top-1
         assert boosted[0].score >= unboosted[0].score
 
-    def test_custom_boost_factor(self, searcher: BM25Search):
+    def test_custom_boost_factor(self, searcher: BM25Search) -> None:
         """A higher boost factor produces a higher score for matching symbols."""
         results_2x = searcher.search("authenticate_user", name_boost=2.0)
         results_5x = searcher.search("authenticate_user", name_boost=5.0)
@@ -246,28 +253,28 @@ class TestNameBoosting:
 class TestFiltering:
     """All post-filters work correctly."""
 
-    def test_symbol_type_filter(self, searcher: BM25Search):
+    def test_symbol_type_filter(self, searcher: BM25Search) -> None:
         """Filter to classes only — should exclude functions."""
         results = searcher.search("authenticate", symbol_type="class")
         assert len(results) > 0
         for r in results:
             assert r.metadata["symbol_type"] == "class"
 
-    def test_repo_id_filter(self, searcher: BM25Search):
+    def test_repo_id_filter(self, searcher: BM25Search) -> None:
         """Filter to a specific repo."""
         results = searcher.search("authenticate_user", repo_id="other-org/other-repo")
         assert len(results) > 0
         for r in results:
             assert r.metadata["repo_id"] == "other-org/other-repo"
 
-    def test_file_path_exact_filter(self, searcher: BM25Search):
+    def test_file_path_exact_filter(self, searcher: BM25Search) -> None:
         """Exact file path match."""
         results = searcher.search("authenticate_user", file_path="src/api.py")
         assert len(results) > 0
         for r in results:
             assert r.file_path == "src/api.py"
 
-    def test_file_path_glob_filter(self, searcher: BM25Search):
+    def test_file_path_glob_filter(self, searcher: BM25Search) -> None:
         """Glob pattern file path filter."""
         results = searcher.search("authenticate", file_path="src/*.py")
         assert len(results) > 0
@@ -275,7 +282,7 @@ class TestFiltering:
             assert r.file_path.startswith("src/")
             assert r.file_path.endswith(".py")
 
-    def test_combined_filters(self, searcher: BM25Search):
+    def test_combined_filters(self, searcher: BM25Search) -> None:
         """Multiple filters applied simultaneously."""
         results = searcher.search(
             "authenticate_user",
@@ -296,11 +303,11 @@ class TestFiltering:
 class TestTopK:
     """Top-k limit and config default."""
 
-    def test_top_k_limits_output(self, searcher: BM25Search):
+    def test_top_k_limits_output(self, searcher: BM25Search) -> None:
         results = searcher.search("authenticate", top_k=1)
         assert len(results) == 1
 
-    def test_default_top_k(self, searcher: BM25Search):
+    def test_default_top_k(self, searcher: BM25Search) -> None:
         """When top_k=None, uses settings.bm25_search_top_k (default 20)."""
         results = searcher.search("authenticate")
         # We have fewer docs than 20, so all matching docs return
@@ -315,7 +322,7 @@ class TestTopK:
 class TestLoadIndex:
     """Index load from disk."""
 
-    def test_load_and_search(self, bm25_index: BM25Index, tmp_path: Path):
+    def test_load_and_search(self, bm25_index: BM25Index, tmp_path: Path) -> None:
         """Save an index, load it via BM25Search.load_index, and search."""
         pkl_path = tmp_path / "test.bm25.pkl"
         bm25_index.save(pkl_path)
