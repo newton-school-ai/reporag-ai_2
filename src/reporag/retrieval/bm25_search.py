@@ -145,19 +145,29 @@ class BM25Search:
         # ------------------------------------------------------------------
         # The spec checks `symbol_name in query` but our symbols are
         # qualified names like "auth.authenticate_user".  We check
-        # `query in symbol` instead, so "authenticate_user" correctly
-        # matches "auth.authenticate_user".
-        query_lower = query.strip().lower()
+        # if the query tokens are a sublist of the symbol tokens, so
+        # "getUserById" matches "get_user_by_id".
+        query_tokens = self._index.tokenizer(query)
+        query_len = len(query_tokens)
         boosted: list[tuple[float, dict[str, Any]]] = []
 
         for hit in raw_results:
             score = hit["score"]
             meta = hit["metadata"]
 
-            if name_boost > 1.0:
+            if name_boost > 1.0 and query_len > 0:
                 symbol = meta.get("symbol")
-                if symbol and query_lower in symbol.lower():
-                    score *= name_boost
+                if symbol:
+                    symbol_tokens = self._index.tokenizer(symbol)
+
+                    is_match = False
+                    for i in range(len(symbol_tokens) - query_len + 1):
+                        if symbol_tokens[i : i + query_len] == query_tokens:
+                            is_match = True
+                            break
+
+                    if is_match:
+                        score *= name_boost
 
             boosted.append((score, meta))
 

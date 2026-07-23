@@ -244,6 +244,15 @@ class TestNameBoosting:
         # The 5x boost should produce a higher score
         assert results_5x[0].score > results_2x[0].score
 
+    def test_camelcase_query_matches_snakecase_symbol(
+        self, searcher: BM25Search
+    ) -> None:
+        """A camelCase query should boost a snake_case symbol via tokenized matching."""
+        # Using "authenticateUser" against "auth.authenticate_user"
+        results = searcher.search("authenticateUser", top_k=10)
+        assert len(results) > 0
+        assert results[0].symbol_name == "auth.authenticate_user"
+
 
 # ---------------------------------------------------------------------------
 # TestFiltering: post-filter on metadata
