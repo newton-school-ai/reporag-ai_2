@@ -139,7 +139,7 @@ class GraphRetriever:
         # or we could compute accurate shortest paths. We'll use depth for the pseudo-score.
         return [self._node_to_result(n, distance=depth) for n in nodes]
 
-    def get_callers(self, symbol_id: str, depth: int = 1) -> list[RetrievalResult]:
+    def get_callers(self, symbol_id: str, depth: int = 2) -> list[RetrievalResult]:
         """Return symbols that call the given symbol within `depth` hops.
 
         Args:
