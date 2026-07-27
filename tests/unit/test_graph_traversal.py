@@ -20,7 +20,7 @@ from reporag.graph.call_graph import CallEdge
 from reporag.graph.dependency_graph import DependencyEdge
 from reporag.graph.neo4j_store import NetworkXGraphStore
 from reporag.graph.symbol_table import SymbolRecord, SymbolTable
-from reporag.retrieval.graph_traversal import GraphRetriever
+from reporag.retrieval.graph_traversal import GraphRetriever, GraphSubgraph
 from reporag.retrieval.vector_search import RetrievalResult
 
 # ---------------------------------------------------------------------------
@@ -272,20 +272,20 @@ class TestGetNeighbors:
         """NetworkXGraphStore.get_neighbors returns [] when node not in graph (line 532)."""
         assert graph_retriever.get_neighbors("nonexistent_symbol") == []
 
-    def test_depth_1_score_greater_than_depth_2_score(
+    def test_true_hop_distance_scores_within_single_call(
         self, graph_retriever: GraphRetriever
     ) -> None:
-        """score = 1/(depth+1): depth-1 results must score higher than depth-2 results."""
-        results_d1 = graph_retriever.get_neighbors(
-            "func_login", depth=1, direction="out"
-        )
-        results_d2 = graph_retriever.get_neighbors(
-            "func_login", depth=2, direction="out"
-        )
-        assert results_d1
-        assert results_d2
-        # All depth-1 results score 0.5; all depth-2 results score 0.33
-        assert results_d1[0].score > results_d2[0].score
+        """Within get_neighbors(depth=2), 1-hop nodes score 0.5 and 2-hop nodes score 0.33.
+
+        Topology: func_login -CALLS-> func_auth -CALLS-> func_verify
+        func_auth is 1 hop from func_login; func_verify is 2 hops.
+        """
+        results = graph_retriever.get_neighbors("func_login", depth=2, direction="out")
+        by_name = {r.symbol_name: r for r in results}
+        assert "authenticate" in by_name, "func_auth must be reachable"
+        assert "verify_token" in by_name, "func_verify must be reachable at depth 2"
+        assert by_name["authenticate"].score == pytest.approx(0.5)
+        assert by_name["verify_token"].score == pytest.approx(1 / 3, abs=0.001)
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +313,17 @@ class TestGetCallers:
         symbol_names = {r.symbol_name for r in results}
         assert "authenticate" in symbol_names
         assert "login" in symbol_names
+
+    def test_direct_caller_scores_higher_than_transitive(
+        self, graph_retriever: GraphRetriever
+    ) -> None:
+        """Direct caller (hop 1) must score 0.5; transitive (hop 2) must score 0.33."""
+        results = graph_retriever.get_callers("func_verify", depth=2)
+        by_name = {r.symbol_name: r for r in results}
+        assert "authenticate" in by_name, "direct caller (1 hop) must be present"
+        assert "login" in by_name, "transitive caller (2 hops) must be present"
+        assert by_name["authenticate"].score == pytest.approx(0.5)
+        assert by_name["login"].score == pytest.approx(1 / 3, abs=0.001)
 
     def test_unknown_symbol_returns_empty_list(
         self, graph_retriever: GraphRetriever
@@ -377,31 +388,59 @@ class TestFindPaths:
 
 
 class TestExtractSubgraph:
-    """extract_subgraph must return one RetrievalResult per requested node."""
+    """extract_subgraph must return a GraphSubgraph with nodes and edges."""
+
+    def test_returns_graph_subgraph_instance(
+        self, graph_retriever: GraphRetriever
+    ) -> None:
+        result = graph_retriever.extract_subgraph(["func_login", "func_auth"])
+        assert isinstance(result, GraphSubgraph)
 
     def test_nodes_returned_for_each_requested_id(
         self, graph_retriever: GraphRetriever
     ) -> None:
-        results = graph_retriever.extract_subgraph(["func_login", "func_auth"])
-        assert len(results) == 2
-        names = {r.symbol_name for r in results}
+        result = graph_retriever.extract_subgraph(["func_login", "func_auth"])
+        assert len(result.nodes) == 2
+        names = {r.symbol_name for r in result.nodes}
         assert names == {"login", "authenticate"}
 
-    def test_all_results_have_score_1(self, graph_retriever: GraphRetriever) -> None:
+    def test_all_nodes_have_score_1(self, graph_retriever: GraphRetriever) -> None:
         """Subgraph nodes are always at distance 0 -> score 1.0."""
-        results = graph_retriever.extract_subgraph(["func_login", "func_auth"])
-        for r in results:
+        result = graph_retriever.extract_subgraph(["func_login", "func_auth"])
+        for r in result.nodes:
             assert r.score == pytest.approx(1.0)
 
-    def test_empty_input_returns_empty_list(
+    def test_edges_returned_for_internal_connections(
         self, graph_retriever: GraphRetriever
     ) -> None:
-        """subgraph([]) must not raise and must return []."""
-        assert graph_retriever.extract_subgraph([]) == []
+        """The CALLS edge between func_login and func_auth must appear in the result."""
+        result = graph_retriever.extract_subgraph(["func_login", "func_auth"])
+        assert len(result.edges) >= 1
+        edge_pairs = {(e["source"], e["target"]) for e in result.edges}
+        assert ("func_login", "func_auth") in edge_pairs
+
+    def test_edge_type_present_in_edge_dict(
+        self, graph_retriever: GraphRetriever
+    ) -> None:
+        """Every edge dict must carry a 'type' key as documented by the store."""
+        result = graph_retriever.extract_subgraph(["func_login", "func_auth"])
+        for edge in result.edges:
+            assert "type" in edge
+            assert "source" in edge
+            assert "target" in edge
+
+    def test_empty_input_returns_empty_subgraph(
+        self, graph_retriever: GraphRetriever
+    ) -> None:
+        """subgraph([]) must not raise and must return empty nodes and edges."""
+        result = graph_retriever.extract_subgraph([])
+        assert result.nodes == []
+        assert result.edges == []
 
     def test_unknown_ids_silently_omitted(
         self, graph_retriever: GraphRetriever
     ) -> None:
         """NetworkXGraphStore.subgraph skips unknown ids (line 636: has_node guard)."""
-        results = graph_retriever.extract_subgraph(["nonexistent_id"])
-        assert results == []
+        result = graph_retriever.extract_subgraph(["nonexistent_id"])
+        assert result.nodes == []
+        assert result.edges == []

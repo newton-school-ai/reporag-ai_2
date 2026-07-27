@@ -36,17 +36,30 @@ Known limitations
   backend because ``GraphStoreProtocol.shortest_path`` has no depth
   bound parameter.  It is kept in the signature for API symmetry with
   the Issue 18 acceptance criteria.
-* All nodes returned by ``get_neighbors`` and ``get_callers`` receive
-  the same pseudo-score (``1.0 / (depth + 1.0)``) because the
-  ``GraphStoreProtocol`` returns a flat list without per-node hop counts.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from reporag.graph.neo4j_store import GraphStore, GraphStoreProtocol
 from reporag.retrieval.vector_search import RetrievalResult
+
+
+@dataclass
+class GraphSubgraph:
+    """Nodes and edges of an induced subgraph.
+
+    Attributes:
+        nodes: One :class:`~reporag.retrieval.vector_search.RetrievalResult`
+            per node in the induced subgraph, all at distance 0 (score 1.0).
+        edges: Raw edge dicts from the underlying store; each dict
+            contains at least ``source``, ``target``, and ``type`` keys.
+    """
+
+    nodes: list[RetrievalResult]
+    edges: list[dict[str, Any]]
 
 
 class GraphRetriever:
@@ -133,14 +146,29 @@ class GraphRetriever:
         Returns:
             List of RetrievalResult.
         """
-        nodes = self._store.get_neighbors(symbol_id, depth=depth, direction=direction)
-        # Note: get_neighbors in the store doesn't return the exact distance,
-        # but we can assume depth is the max. For simplicity, we just assign the depth as distance
-        # or we could compute accurate shortest paths. We'll use depth for the pseudo-score.
-        return [self._node_to_result(n, distance=depth) for n in nodes]
+        # Compute each node's true hop distance by querying the store ring-by-ring.
+        # get_neighbors(depth=h) returns all nodes within h hops (BFS into visited);
+        # calling for hop=1, 2, ..., depth and recording the first hop at which each
+        # node appears gives its exact distance from symbol_id.
+        hop_by_id: dict[str, int] = {}
+        node_by_id: dict[str, Any] = {}
+        for hop in range(1, depth + 1):
+            ring = self._store.get_neighbors(symbol_id, depth=hop, direction=direction)
+            for node in ring:
+                nid = node.get("symbol_id")
+                if nid is not None and nid not in hop_by_id:
+                    hop_by_id[nid] = hop
+                    node_by_id[nid] = node
+        return [
+            self._node_to_result(node_by_id[nid], distance=hop_by_id[nid])
+            for nid in hop_by_id
+        ]
 
     def get_callers(self, symbol_id: str, depth: int = 2) -> list[RetrievalResult]:
-        """Return symbols that call the given symbol within `depth` hops.
+        """Return symbols that call the given symbol within ``depth`` hops.
+
+        Each result's score reflects its true hop distance -- a direct caller
+        (hop 1) scores higher than a transitive caller (hop 2).
 
         Args:
             symbol_id: The symbol_id of the target node.
@@ -149,11 +177,21 @@ class GraphRetriever:
         Returns:
             List of RetrievalResult representing the callers.
         """
-        # Call edges are caller -> callee. So to find callers, we traverse 'in' edges.
-        nodes = self._store.get_neighbors(
-            symbol_id, edge_types=["CALLS"], depth=depth, direction="in"
-        )
-        return [self._node_to_result(n, distance=depth) for n in nodes]
+        hop_by_id: dict[str, int] = {}
+        node_by_id: dict[str, Any] = {}
+        for hop in range(1, depth + 1):
+            ring = self._store.get_neighbors(
+                symbol_id, edge_types=["CALLS"], depth=hop, direction="in"
+            )
+            for node in ring:
+                nid = node.get("symbol_id")
+                if nid is not None and nid not in hop_by_id:
+                    hop_by_id[nid] = hop
+                    node_by_id[nid] = node
+        return [
+            self._node_to_result(node_by_id[nid], distance=hop_by_id[nid])
+            for nid in hop_by_id
+        ]
 
     def find_paths(
         self, source_id: str, target_id: str, max_depth: int = 5
@@ -176,12 +214,17 @@ class GraphRetriever:
         # For a path, distance can be the index in the path.
         return [self._node_to_result(n, distance=i) for i, n in enumerate(nodes)]
 
-    def extract_subgraph(self, symbol_ids: list[str]) -> list[RetrievalResult]:
+    def extract_subgraph(self, symbol_ids: list[str]) -> GraphSubgraph:
         """Extract the induced subgraph over the given symbol_ids.
 
-        Returns the nodes in the subgraph. (Edges are retrieved by the underlying
-        store, but RetrievalResult only represents nodes. If edge representation is
-        needed, they can be stored in the metadata, but typically RAG only needs chunks).
+        Returns:
+            A :class:`GraphSubgraph` with one :class:`RetrievalResult` per node
+            (at distance 0, score 1.0) and the raw edge dicts connecting those
+            nodes.  Each edge dict contains at least ``source``, ``target``,
+            and ``type`` keys as provided by the underlying store.
         """
-        nodes, _edges = self._store.subgraph(symbol_ids)
-        return [self._node_to_result(n, distance=0) for n in nodes]
+        nodes, edges = self._store.subgraph(symbol_ids)
+        return GraphSubgraph(
+            nodes=[self._node_to_result(n, distance=0) for n in nodes],
+            edges=edges,
+        )
