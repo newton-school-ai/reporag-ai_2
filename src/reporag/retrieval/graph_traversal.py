@@ -1,11 +1,49 @@
 """Graph-based retrieval.
 
-Uses the code knowledge graph for structural queries: N-hop neighbors,
-shortest paths between symbols, and subgraph extraction. Converts graph
-results to the common RetrievalResult schema.
+Answers structural questions that vector search and BM25 cannot: "What
+functions call ``authenticate_user``?" or "Trace the path from the router
+to the database layer." Vector search blurs structurally-distinct but
+semantically-similar symbols together; graph traversal follows typed edges
+(``CALLS``, ``IMPORTS``, ``INHERITS``) in the knowledge graph built by
+Issues 9, 10, and 12.
+
+Design
+------
+:class:`GraphRetriever` is a thin query-side wrapper around the
+:class:`~reporag.graph.neo4j_store.GraphStoreProtocol` interface -- all
+graph construction and edge resolution happens in the upstream pipeline.
+This module only:
+
+* Delegates traversal to the backend via the three protocol methods
+  (``get_neighbors``, ``shortest_path``, ``subgraph``) so that the
+  caller is insulated from Neo4j Cypher or NetworkX BFS details,
+* Converts raw node-property dicts into the unified
+  :class:`~reporag.retrieval.vector_search.RetrievalResult` schema so
+  downstream fusion (:mod:`reporag.retrieval.fusion`, Issue 19) can
+  treat all three retrieval paths interchangeably,
+* Synthesises ``chunk_text`` from the ``signature`` and ``docstring``
+  node properties, since the graph store does not hold full source text,
+* Maps traversal hop distance to a strictly-positive pseudo-score
+  ``1.0 / (distance + 1.0)`` (1.0 for the source, 0.5 for 1 hop, 0.33
+  for 2 hops, ...) that is compatible with Reciprocal Rank Fusion.
+
+Known limitations
+-----------------
+* ``find_paths`` returns only the **shortest** path.
+  ``GraphStoreProtocol.shortest_path`` does not expose an all-paths
+  variant; enumerating all paths is left for a future protocol extension.
+* ``max_depth`` accepted by ``find_paths`` is not forwarded to the
+  backend because ``GraphStoreProtocol.shortest_path`` has no depth
+  bound parameter.  It is kept in the signature for API symmetry with
+  the Issue 18 acceptance criteria.
+* All nodes returned by ``get_neighbors`` and ``get_callers`` receive
+  the same pseudo-score (``1.0 / (depth + 1.0)``) because the
+  ``GraphStoreProtocol`` returns a flat list without per-node hop counts.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 from reporag.graph.neo4j_store import GraphStore, GraphStoreProtocol
 from reporag.retrieval.vector_search import RetrievalResult
@@ -38,7 +76,9 @@ class GraphRetriever:
             uri = neo4j_uri or "bolt://localhost:7687"
             self._store = GraphStore(uri=uri, fallback=fallback)
 
-    def _node_to_result(self, node: dict, distance: int = 0) -> RetrievalResult:
+    def _node_to_result(
+        self, node: dict[str, Any], distance: int = 0
+    ) -> RetrievalResult:
         """Convert a graph node dictionary to a RetrievalResult.
 
         Uses distance to compute a pseudo-score (1.0 / (distance + 1)).
@@ -65,9 +105,10 @@ class GraphRetriever:
         # We don't want to duplicate fields that have dedicated attributes,
         # but the schema allows keeping them in metadata too.
 
-        # Distance is technically the number of hops. We give 1.0 to the node itself (dist 0),
-        # 0.5 to dist 1, 0.33 to dist 2, etc.
-        score = 1.0 / (distance + 1.0) if distance >= 0 else 0.1
+        # Distance is the number of hops from the query node.
+        # We give 1.0 to the node itself (dist 0), 0.5 to dist 1, 0.33 to dist 2, etc.
+        # All call sites pass non-negative values (depth arg or enumerate index).
+        score = 1.0 / (distance + 1.0)
 
         return RetrievalResult(
             score=score,
