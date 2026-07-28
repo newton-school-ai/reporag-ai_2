@@ -26,16 +26,6 @@ This module only:
 * Maps traversal hop distance to a strictly-positive pseudo-score
   ``1.0 / (distance + 1.0)`` (1.0 for the source, 0.5 for 1 hop, 0.33
   for 2 hops, ...) that is compatible with Reciprocal Rank Fusion.
-
-Known limitations
------------------
-* ``find_paths`` returns only the **shortest** path.
-  ``GraphStoreProtocol.shortest_path`` does not expose an all-paths
-  variant; enumerating all paths is left for a future protocol extension.
-* ``max_depth`` accepted by ``find_paths`` is not forwarded to the
-  backend because ``GraphStoreProtocol.shortest_path`` has no depth
-  bound parameter.  It is kept in the signature for API symmetry with
-  the Issue 18 acceptance criteria.
 """
 
 from __future__ import annotations
@@ -279,7 +269,7 @@ class GraphRetriever:
                     if len(path) - 1 >= max_depth:
                         continue
 
-                    ring = self._store.get_neighbors(curr, depth=1, direction="out")
+                    ring = self._store.get_neighbors(curr, depth=1, direction="both")
                     for node in ring:
                         nid = node.get("symbol_id")
                         if nid:
