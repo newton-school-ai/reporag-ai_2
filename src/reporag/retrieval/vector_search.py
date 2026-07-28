@@ -54,6 +54,7 @@ class RetrievalResult:
     symbol_name: str | None
     chunk_text: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    rerank_score: float | None = None
 
 
 class VectorSearch:
