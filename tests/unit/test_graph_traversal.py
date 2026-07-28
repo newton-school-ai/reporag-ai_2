@@ -20,7 +20,11 @@ from reporag.graph.call_graph import CallEdge
 from reporag.graph.dependency_graph import DependencyEdge
 from reporag.graph.neo4j_store import NetworkXGraphStore
 from reporag.graph.symbol_table import SymbolRecord, SymbolTable
-from reporag.retrieval.graph_traversal import GraphRetriever, GraphSubgraph
+from reporag.retrieval.graph_traversal import (
+    GraphRetriever,
+    GraphSubgraph,
+    SymbolNotFoundError,
+)
 from reporag.retrieval.vector_search import RetrievalResult
 
 # ---------------------------------------------------------------------------
@@ -29,9 +33,8 @@ from reporag.retrieval.vector_search import RetrievalResult
 
 
 @pytest.fixture
-def test_graph_store() -> NetworkXGraphStore:
-    """Fixture that builds a realistic small graph store with NetworkX fallback."""
-    # 1. Create SymbolTable
+def test_symbol_table() -> SymbolTable:
+    """Fixture that builds the SymbolTable for the test graph."""
     table = SymbolTable()
     records = [
         SymbolRecord(
@@ -97,7 +100,12 @@ def test_graph_store() -> NetworkXGraphStore:
     ]
     for r in records:
         table.add(r)
+    return table
 
+
+@pytest.fixture
+def test_graph_store(test_symbol_table: SymbolTable) -> NetworkXGraphStore:
+    """Fixture that builds a realistic small graph store with NetworkX fallback."""
     # 2. Call Edges (login -> authenticate -> verify_token)
     call_edges = [
         CallEdge(
@@ -135,13 +143,15 @@ def test_graph_store() -> NetworkXGraphStore:
 
     # 4. Initialize store and persist
     store = NetworkXGraphStore()
-    store.persist_graph(call_edges, dep_edges, table)
+    store.persist_graph(call_edges, dep_edges, test_symbol_table)
     return store
 
 
 @pytest.fixture
-def graph_retriever(test_graph_store: NetworkXGraphStore) -> GraphRetriever:
-    return GraphRetriever(store=test_graph_store)
+def graph_retriever(
+    test_graph_store: NetworkXGraphStore, test_symbol_table: SymbolTable
+) -> GraphRetriever:
+    return GraphRetriever(store=test_graph_store, symbol_table=test_symbol_table)
 
 
 # ---------------------------------------------------------------------------
@@ -266,11 +276,10 @@ class TestGetNeighbors:
         assert "verify_token" in symbol_names
         assert "login" not in symbol_names
 
-    def test_unknown_symbol_returns_empty_list(
-        self, graph_retriever: GraphRetriever
-    ) -> None:
-        """NetworkXGraphStore.get_neighbors returns [] when node not in graph (line 532)."""
-        assert graph_retriever.get_neighbors("nonexistent_symbol") == []
+    def test_unknown_symbol_raises_error(self, graph_retriever: GraphRetriever) -> None:
+        """Unknown symbol should raise SymbolNotFoundError."""
+        with pytest.raises(SymbolNotFoundError):
+            graph_retriever.get_neighbors("nonexistent_symbol")
 
     def test_true_hop_distance_scores_within_single_call(
         self, graph_retriever: GraphRetriever
@@ -286,6 +295,16 @@ class TestGetNeighbors:
         assert "verify_token" in by_name, "func_verify must be reachable at depth 2"
         assert by_name["authenticate"].score == pytest.approx(0.5)
         assert by_name["verify_token"].score == pytest.approx(1 / 3, abs=0.001)
+
+    def test_symbol_name_resolution(self, graph_retriever: GraphRetriever) -> None:
+        """Passing a plain name like 'authenticate' should resolve via SymbolTable."""
+        # "authenticate" resolves to symbol_id "func_auth"
+        results = graph_retriever.get_neighbors(
+            "authenticate", depth=1, direction="both"
+        )
+        names = {r.symbol_name for r in results}
+        assert "login" in names
+        assert "verify_token" in names
 
 
 # ---------------------------------------------------------------------------
@@ -325,10 +344,9 @@ class TestGetCallers:
         assert by_name["authenticate"].score == pytest.approx(0.5)
         assert by_name["login"].score == pytest.approx(1 / 3, abs=0.001)
 
-    def test_unknown_symbol_returns_empty_list(
-        self, graph_retriever: GraphRetriever
-    ) -> None:
-        assert graph_retriever.get_callers("nonexistent_symbol") == []
+    def test_unknown_symbol_raises_error(self, graph_retriever: GraphRetriever) -> None:
+        with pytest.raises(SymbolNotFoundError):
+            graph_retriever.get_callers("nonexistent_symbol")
 
 
 # ---------------------------------------------------------------------------
@@ -343,43 +361,56 @@ class TestFindPaths:
         self, graph_retriever: GraphRetriever
     ) -> None:
         results = graph_retriever.find_paths("func_login", "func_verify")
-        assert len(results) == 3
-        names = [r.symbol_name for r in results]
+        assert len(results.shortest) == 3
+        names = [r.symbol_name for r in results.shortest]
         assert names == ["login", "authenticate", "verify_token"]
 
     def test_source_node_has_score_1(self, graph_retriever: GraphRetriever) -> None:
         results = graph_retriever.find_paths("func_login", "func_verify")
-        assert results[0].score == pytest.approx(1.0)
+        assert results.shortest[0].score == pytest.approx(1.0)
 
     def test_intermediate_node_score_decreases_with_distance(
         self, graph_retriever: GraphRetriever
     ) -> None:
         results = graph_retriever.find_paths("func_login", "func_verify")
-        assert results[1].score == pytest.approx(0.5)
-        assert results[2].score == pytest.approx(1 / 3, abs=0.001)
+        assert results.shortest[1].score == pytest.approx(0.5)
+        assert results.shortest[2].score == pytest.approx(1 / 3, abs=0.001)
 
     def test_no_path_returns_empty_list(self, graph_retriever: GraphRetriever) -> None:
         """class_user is disconnected from the call chain."""
-        assert graph_retriever.find_paths("func_login", "class_user") == []
+        paths = graph_retriever.find_paths("func_login", "class_user")
+        assert paths.shortest == []
+        assert paths.all_paths == []
 
-    def test_unknown_source_returns_empty_list(
-        self, graph_retriever: GraphRetriever
-    ) -> None:
-        """NetworkXGraphStore.shortest_path returns [] on unknown node (line 595)."""
-        assert graph_retriever.find_paths("nonexistent", "func_verify") == []
+    def test_unknown_source_raises_error(self, graph_retriever: GraphRetriever) -> None:
+        """Unknown source should raise SymbolNotFoundError."""
+        with pytest.raises(SymbolNotFoundError):
+            graph_retriever.find_paths("nonexistent", "func_verify")
 
-    def test_unknown_target_returns_empty_list(
-        self, graph_retriever: GraphRetriever
-    ) -> None:
-        assert graph_retriever.find_paths("func_login", "nonexistent") == []
+    def test_unknown_target_raises_error(self, graph_retriever: GraphRetriever) -> None:
+        with pytest.raises(SymbolNotFoundError):
+            graph_retriever.find_paths("func_login", "nonexistent")
 
     def test_source_equals_target(self, graph_retriever: GraphRetriever) -> None:
         """A path from a node to itself should return a single-node list."""
         results = graph_retriever.find_paths("func_auth", "func_auth")
         # nx.shortest_path(G, x, x) returns [x], so we expect one result at distance 0.
-        assert len(results) == 1
-        assert results[0].symbol_name == "authenticate"
-        assert results[0].score == pytest.approx(1.0)
+        assert len(results.shortest) == 1
+        assert results.shortest[0].symbol_name == "authenticate"
+        assert results.shortest[0].score == pytest.approx(1.0)
+
+    def test_all_paths_populated(self, graph_retriever: GraphRetriever) -> None:
+        """all_paths should contain the simple paths found via DFS."""
+        paths = graph_retriever.find_paths("func_login", "func_verify")
+        assert len(paths.all_paths) >= 1
+        assert len(paths.all_paths[0]) == 3
+
+    def test_max_depth_bounds_paths(self, graph_retriever: GraphRetriever) -> None:
+        """Paths longer than max_depth should be excluded."""
+        # path is 2 hops (length 3). With max_depth=1, it should be empty.
+        paths = graph_retriever.find_paths("func_login", "func_verify", max_depth=1)
+        assert paths.shortest == []
+        assert paths.all_paths == []
 
 
 # ---------------------------------------------------------------------------
@@ -437,10 +468,7 @@ class TestExtractSubgraph:
         assert result.nodes == []
         assert result.edges == []
 
-    def test_unknown_ids_silently_omitted(
-        self, graph_retriever: GraphRetriever
-    ) -> None:
-        """NetworkXGraphStore.subgraph skips unknown ids (line 636: has_node guard)."""
-        result = graph_retriever.extract_subgraph(["nonexistent_id"])
-        assert result.nodes == []
-        assert result.edges == []
+    def test_unknown_ids_raises_error(self, graph_retriever: GraphRetriever) -> None:
+        """Passing unknown ids should raise SymbolNotFoundError."""
+        with pytest.raises(SymbolNotFoundError):
+            graph_retriever.extract_subgraph(["nonexistent_id"])

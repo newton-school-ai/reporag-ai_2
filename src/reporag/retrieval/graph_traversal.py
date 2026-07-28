@@ -44,7 +44,29 @@ from dataclasses import dataclass
 from typing import Any
 
 from reporag.graph.neo4j_store import GraphStore, GraphStoreProtocol
+from reporag.graph.symbol_table import SymbolTable
 from reporag.retrieval.vector_search import RetrievalResult
+
+
+class SymbolNotFoundError(Exception):
+    pass
+
+
+class AmbiguousSymbolError(Exception):
+    pass
+
+
+@dataclass
+class GraphPaths:
+    """Paths between two symbols.
+
+    Attributes:
+        shortest: The shortest path as a list of RetrievalResult.
+        all_paths: All simple paths up to max_depth, each as a list of RetrievalResult.
+    """
+
+    shortest: list[RetrievalResult]
+    all_paths: list[list[RetrievalResult]]
 
 
 @dataclass
@@ -75,6 +97,7 @@ class GraphRetriever:
         store: GraphStoreProtocol | None = None,
         neo4j_uri: str | None = None,
         fallback: bool = True,
+        symbol_table: SymbolTable | None = None,
     ) -> None:
         """Initialize the GraphRetriever.
 
@@ -82,12 +105,28 @@ class GraphRetriever:
             store: An existing GraphStoreProtocol implementation.
             neo4j_uri: If store is not provided, connects to this URI.
             fallback: If true, falls back to NetworkXGraphStore on failure.
+            symbol_table: Optional SymbolTable to resolve names to ids.
         """
         if store is not None:
             self._store = store
         else:
             uri = neo4j_uri or "bolt://localhost:7687"
             self._store = GraphStore(uri=uri, fallback=fallback)
+        self.symbol_table = symbol_table
+
+    def _resolve(self, symbol: str) -> str:
+        """Resolve a symbol name to a symbol_id using the symbol table."""
+        if not self.symbol_table:
+            return symbol
+        record = self.symbol_table.lookup_qualified(symbol)
+        if record:
+            return record.symbol_id
+        records = self.symbol_table.lookup(symbol)
+        if not records:
+            raise SymbolNotFoundError(f"Symbol {symbol!r} not found in symbol table.")
+        if len(records) > 1:
+            raise AmbiguousSymbolError(f"Symbol {symbol!r} is ambiguous.")
+        return records[0].symbol_id
 
     def _node_to_result(
         self, node: dict[str, Any], distance: int = 0
@@ -133,55 +172,19 @@ class GraphRetriever:
             metadata=metadata,
         )
 
-    def get_neighbors(
-        self, symbol_id: str, depth: int = 1, direction: str = "both"
+    def _get_neighbors_ring_by_ring(
+        self,
+        symbol_id: str,
+        depth: int,
+        direction: str,
+        edge_types: list[str] | None = None,
     ) -> list[RetrievalResult]:
-        """Return N-hop neighbors of the given symbol in the graph.
-
-        Args:
-            symbol_id: The symbol_id of the starting node.
-            depth: Maximum number of hops.
-            direction: 'out', 'in', or 'both'.
-
-        Returns:
-            List of RetrievalResult.
-        """
-        # Compute each node's true hop distance by querying the store ring-by-ring.
-        # get_neighbors(depth=h) returns all nodes within h hops (BFS into visited);
-        # calling for hop=1, 2, ..., depth and recording the first hop at which each
-        # node appears gives its exact distance from symbol_id.
-        hop_by_id: dict[str, int] = {}
-        node_by_id: dict[str, Any] = {}
-        for hop in range(1, depth + 1):
-            ring = self._store.get_neighbors(symbol_id, depth=hop, direction=direction)
-            for node in ring:
-                nid = node.get("symbol_id")
-                if nid is not None and nid not in hop_by_id:
-                    hop_by_id[nid] = hop
-                    node_by_id[nid] = node
-        return [
-            self._node_to_result(node_by_id[nid], distance=hop_by_id[nid])
-            for nid in hop_by_id
-        ]
-
-    def get_callers(self, symbol_id: str, depth: int = 2) -> list[RetrievalResult]:
-        """Return symbols that call the given symbol within ``depth`` hops.
-
-        Each result's score reflects its true hop distance -- a direct caller
-        (hop 1) scores higher than a transitive caller (hop 2).
-
-        Args:
-            symbol_id: The symbol_id of the target node.
-            depth: Maximum number of hops.
-
-        Returns:
-            List of RetrievalResult representing the callers.
-        """
+        """Helper to compute exact hop distances by querying ring-by-ring."""
         hop_by_id: dict[str, int] = {}
         node_by_id: dict[str, Any] = {}
         for hop in range(1, depth + 1):
             ring = self._store.get_neighbors(
-                symbol_id, edge_types=["CALLS"], depth=hop, direction="in"
+                symbol_id, edge_types=edge_types, depth=hop, direction=direction
             )
             for node in ring:
                 nid = node.get("symbol_id")
@@ -193,29 +196,105 @@ class GraphRetriever:
             for nid in hop_by_id
         ]
 
-    def find_paths(
-        self, source_id: str, target_id: str, max_depth: int = 5
+    def get_neighbors(
+        self, symbol: str, depth: int = 1, direction: str = "both"
     ) -> list[RetrievalResult]:
-        """Find the shortest path between two symbols.
+        """Return N-hop neighbors of the given symbol in the graph.
 
         Args:
-            source_id: Starting symbol_id.
-            target_id: Ending symbol_id.
-            max_depth: Included for API compatibility with acceptance criteria,
-                       though shortest_path finds the shortest without depth bound in NetworkX.
+            symbol: The symbol name or symbol_id of the starting node.
+            depth: Maximum number of hops.
+            direction: 'out', 'in', or 'both'.
 
         Returns:
-            List of RetrievalResult for the nodes in the path, in order.
-            Returns empty list if no path is found.
+            List of RetrievalResult.
         """
-        # Note: Issue #18 requests "shortest + all paths", but GraphStoreProtocol
-        # currently only supports `shortest_path`. We document this limitation here.
-        nodes = self._store.shortest_path(source_id, target_id)
-        # For a path, distance can be the index in the path.
-        return [self._node_to_result(n, distance=i) for i, n in enumerate(nodes)]
+        symbol_id = self._resolve(symbol)
+        return self._get_neighbors_ring_by_ring(symbol_id, depth, direction)
 
-    def extract_subgraph(self, symbol_ids: list[str]) -> GraphSubgraph:
-        """Extract the induced subgraph over the given symbol_ids.
+    def get_callers(self, symbol: str, depth: int = 2) -> list[RetrievalResult]:
+        """Return symbols that call the given symbol within ``depth`` hops.
+
+        Each result's score reflects its true hop distance -- a direct caller
+        (hop 1) scores higher than a transitive caller (hop 2).
+
+        Args:
+            symbol: The symbol name or symbol_id of the target node.
+            depth: Maximum number of hops.
+
+        Returns:
+            List of RetrievalResult representing the callers.
+        """
+        symbol_id = self._resolve(symbol)
+        return self._get_neighbors_ring_by_ring(
+            symbol_id, depth, "in", edge_types=["CALLS"]
+        )
+
+    def find_paths(self, source: str, target: str, max_depth: int = 5) -> GraphPaths:
+        """Find the shortest path and all simple paths between two symbols.
+
+        Args:
+            source: Starting symbol name or symbol_id.
+            target: Ending symbol name or symbol_id.
+            max_depth: Paths longer than this are excluded from both shortest
+                and all_paths.
+
+        Returns:
+            A GraphPaths containing the shortest path and all valid simple paths.
+        """
+        source_id = self._resolve(source)
+        target_id = self._resolve(target)
+
+        shortest_nodes = self._store.shortest_path(source_id, target_id)
+        if shortest_nodes and (len(shortest_nodes) - 1) > max_depth:
+            shortest_nodes = []
+
+        shortest = [
+            self._node_to_result(n, distance=i) for i, n in enumerate(shortest_nodes)
+        ]
+
+        all_paths = []
+        if shortest_nodes:
+            # We use DFS over get_neighbors to find all paths up to max_depth
+            # without breaking the GraphStoreProtocol boundaries.
+            nodes_cache: dict[str, Any] = {}
+            source_nodes, _ = self._store.subgraph([source_id])
+            if source_nodes:
+                nodes_cache[source_id] = source_nodes[0]
+
+                # Stack holds: (current_id, path_of_ids, set_of_visited_ids)
+                stack = [(source_id, [source_id], {source_id})]
+
+                while stack:
+                    curr, path, visited = stack.pop()
+                    if curr == target_id:
+                        all_paths.append(
+                            [
+                                self._node_to_result(nodes_cache[nid], distance=i)
+                                for i, nid in enumerate(path)
+                            ]
+                        )
+                        continue
+
+                    if len(path) - 1 >= max_depth:
+                        continue
+
+                    ring = self._store.get_neighbors(curr, depth=1, direction="out")
+                    for node in ring:
+                        nid = node.get("symbol_id")
+                        if nid:
+                            nodes_cache[nid] = node
+                            if nid not in visited:
+                                new_visited = set(visited)
+                                new_visited.add(nid)
+                                stack.append((nid, path + [nid], new_visited))
+
+        # Optional: reverse so shorter paths tend to appear first if needed
+        all_paths.reverse()
+        return GraphPaths(shortest=shortest, all_paths=all_paths)
+
+    def extract_subgraph(self, symbols: list[str]) -> GraphSubgraph:
+        """Extract the induced subgraph over the given symbols.
 
         Returns:
             A :class:`GraphSubgraph` with one :class:`RetrievalResult` per node
@@ -223,6 +302,7 @@ class GraphRetriever:
             nodes.  Each edge dict contains at least ``source``, ``target``,
             and ``type`` keys as provided by the underlying store.
         """
+        symbol_ids = [self._resolve(sym) for sym in symbols]
         nodes, edges = self._store.subgraph(symbol_ids)
         return GraphSubgraph(
             nodes=[self._node_to_result(n, distance=0) for n in nodes],
