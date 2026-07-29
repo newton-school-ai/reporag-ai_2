@@ -5,6 +5,7 @@ fused ranking. Handles items present in some lists but not others.
 """
 
 from dataclasses import replace
+from typing import Any
 
 from reporag.retrieval.vector_search import RetrievalResult
 
@@ -19,6 +20,9 @@ def reciprocal_rank_fusion(
     """
     scores: dict[tuple[str, int | None, int | None], float] = {}
     items: dict[tuple[str, int | None, int | None], RetrievalResult] = {}
+    metadata_accumulator: dict[
+        tuple[str, int | None, int | None], list[dict[str, Any]]
+    ] = {}
 
     for lst in ranked_lists:
         seen_in_this_list: set[tuple[str, int | None, int | None]] = set()
@@ -31,11 +35,18 @@ def reciprocal_rank_fusion(
 
             if key not in items:
                 items[key] = item
+                metadata_accumulator[key] = [dict(item.metadata)]
+            else:
+                metadata_accumulator[key].append(dict(item.metadata))
+
             scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
 
     fused = []
     for key, score in scores.items():
-        fused.append(replace(items[key], score=score))
+        merged_meta = {}
+        for m in metadata_accumulator[key]:
+            merged_meta.update(m)
+        fused.append(replace(items[key], score=score, metadata=merged_meta))
 
     fused.sort(
         key=lambda x: (-x.score, x.file_path, x.start_line or 0, x.end_line or 0)

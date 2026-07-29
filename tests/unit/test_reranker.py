@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+from typing import Any
+
 from reporag.retrieval.reranker import CrossEncoderReranker
 from reporag.retrieval.vector_search import RetrievalResult
 
 
 class MockModel:
-    def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
-        # Simple mock logic: length of chunk text (just for deterministic sorting)
-        return [float(len(chunk)) for _, chunk in pairs]
+    def predict(self, pairs: list[tuple[str, str]], **kwargs: Any) -> list[float]:
+        # Return dummy scores: based on length of chunk to be deterministic
+        return [float(len(chunk)) for query, chunk in pairs]
 
 
 def make_result(chunk_text: str) -> RetrievalResult:
