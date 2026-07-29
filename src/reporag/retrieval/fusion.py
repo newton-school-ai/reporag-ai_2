@@ -15,18 +15,33 @@ sources.
 
 Algorithm
 ---------
-For an item appearing at rank ``r`` (1-indexed) in a ranked list, its
-contribution to that list's RRF score is ``1 / (k + r)``. An item's final
-RRF score is the sum of its contributions across every list it appears in;
-lists it is absent from simply contribute nothing (a missing item is not
-penalized beyond not receiving credit). ``k`` dampens the influence of an
-item's exact top rank -- a larger ``k`` flattens the curve so that ranking
-#1 vs #3 in one list matters less; a smaller ``k`` sharpens the curve
-towards whichever list ranks an item highest.
+For an item appearing at rank ``r`` (1-indexed, counting only its first
+occurrence if a list somehow contains a duplicate -- see "Duplicate
+handling" below) in a ranked list, its contribution to that list's RRF
+score is ``1 / (k + r)``. An item's final RRF score is the sum of its
+contributions across every list it appears in; lists it is absent from
+simply contribute nothing (a missing item is not penalized beyond not
+receiving credit). ``k`` dampens the influence of an item's exact top rank
+-- a larger ``k`` flattens the curve so that ranking #1 vs #3 in one list
+matters less; a smaller ``k`` sharpens the curve towards whichever list
+ranks an item highest.
+
+Duplicate handling
+-------------------
+Identity across lists is keyed on ``(file_path, start_line, end_line)``,
+falling back to a ``symbol_name``/``chunk_text`` content hash when a result
+has no location info at all (e.g. a malformed graph node), so two
+genuinely different results never collide onto the same key just because
+both are missing location data. Within a single list, if the same item
+somehow appears more than once (a caller-side bug -- upstream retrievers
+already dedupe their own output), only its first/best-ranked occurrence is
+counted; later repeats are skipped rather than inflating that list's
+contribution.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Sequence
 
@@ -37,13 +52,35 @@ logger = logging.getLogger(__name__)
 
 # Identity key for "the same underlying chunk" across independently ranked
 # lists. Mirrors the dedup key already used in
-# VectorSearch.search (file_path, start_line, end_line).
+# VectorSearch.search (file_path, start_line, end_line) -- but see
+# _result_key below for the fallback this alone can't handle.
 ResultKey = tuple[str, int | None, int | None]
+
+# Sentinel prefix marking a fallback (content-hash-based) key, so it can
+# never collide with a real file_path a retriever might produce.
+_NO_LOCATION_PREFIX = "__no_location__:"
 
 
 def _result_key(result: RetrievalResult) -> ResultKey:
-    """Identity key used to recognize the same chunk across ranked lists."""
-    return (result.file_path, result.start_line, result.end_line)
+    """Identity key used to recognize the same chunk across ranked lists.
+
+    Normally ``(file_path, start_line, end_line)`` is a reliable identity --
+    it's the same convention ``VectorSearch.search`` already dedupes on.
+    But a result with **no** location info at all (empty ``file_path`` and
+    both line numbers ``None`` -- e.g. a malformed or synthetic graph node)
+    would otherwise collapse every such result onto the same
+    ``("", None, None)`` key, silently merging distinct items. In that case,
+    fall back to hashing ``symbol_name`` + ``chunk_text`` instead, so two
+    results are only treated as "the same item" when they actually share
+    content, not just a missing location.
+    """
+    if result.file_path or result.start_line is not None or result.end_line is not None:
+        return (result.file_path, result.start_line, result.end_line)
+
+    content_hash = hashlib.sha256(
+        f"{result.symbol_name or ''}|{result.chunk_text}".encode()
+    ).hexdigest()
+    return (f"{_NO_LOCATION_PREFIX}{content_hash}", None, None)
 
 
 def reciprocal_rank_fusion(
@@ -60,12 +97,17 @@ def reciprocal_rank_fusion(
       the cross-encoder reranker
       (:meth:`~reporag.retrieval.reranker.CrossEncoderReranker.rerank`)
       then refines further.
-    - **Algorithm**: Walks each list in rank order (index 0 = rank 1) and
-      adds ``weight / (k + rank)`` to that item's running RRF score, keyed
-      on ``(file_path, start_line, end_line)``. An item's final score is
-      the sum across every list it appeared in -- a list it's absent from
-      simply contributes nothing, so no item is penalized for a source
-      that didn't retrieve it.
+    - **Algorithm**: Walks each list in rank order and adds
+      ``weight / (k + rank)`` to that item's running RRF score, keyed on
+      ``(file_path, start_line, end_line)`` -- or a content hash of
+      ``symbol_name``/``chunk_text`` when a result has no location info at
+      all, so two distinct location-less results (e.g. malformed graph
+      nodes) are never merged just because both are missing a location. An
+      item's final score is the sum across every list it appeared in -- a
+      list it's absent from simply contributes nothing, so no item is
+      penalized for a source that didn't retrieve it. If the same item
+      appears more than once *within* a single list, only its first
+      (best-ranked) occurrence counts towards that list's contribution.
     - **Representative result**: When the same item appears in multiple
       lists, the merged ``RetrievalResult`` keeps the fields (file_path,
       chunk_text, symbol_name, ...) from whichever occurrence has the
@@ -138,9 +180,26 @@ def reciprocal_rank_fusion(
     for list_idx, ranked_list in enumerate(ranked_lists):
         weight = resolved_weights[list_idx]
         name = resolved_names[list_idx]
-        for rank0, result in enumerate(ranked_list):
-            rank = rank0 + 1
+        seen_in_this_list: set[ResultKey] = set()
+        rank = 0
+        for result in ranked_list:
             key = _result_key(result)
+            if key in seen_in_this_list:
+                # Defensive dedup: RRF assumes each input list is a clean
+                # ranking with no repeats. If the same item appears twice
+                # in one list (a caller-side bug -- upstream retrievers
+                # like VectorSearch/BM25Search already dedupe their own
+                # output), only its first/best-ranked occurrence counts,
+                # so a duplicate can never inflate that list's contribution.
+                logger.debug(
+                    "reciprocal_rank_fusion: skipping duplicate item in "
+                    "list %r (key=%r)",
+                    name,
+                    key,
+                )
+                continue
+            seen_in_this_list.add(key)
+            rank += 1
 
             scores[key] = scores.get(key, 0.0) + weight / (k + rank)
             source_scores.setdefault(key, {})[name] = result.score

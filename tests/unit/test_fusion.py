@@ -263,39 +263,73 @@ def test_fusion_does_not_mutate_callers_original_metadata() -> None:
     assert "rrf_source_scores" not in original_metadata
 
 
-def test_duplicate_item_within_a_single_list_is_double_counted() -> None:
-    """A caller-side bug (same item twice in one list) is NOT deduped internally.
+def test_duplicate_item_within_a_single_list_is_deduped_not_double_counted() -> None:
+    """A caller-side bug (same item twice in one list) no longer inflates its score.
 
     RRF assumes each input list is a clean ranking with no repeats. If an
-    item appears twice within one list, its contribution from that list is
-    added twice (once per occurrence) -- this pins the current behavior so
-    a future change either preserves it deliberately or is caught here.
-    Upstream callers (VectorSearch, BM25Search) already dedupe their own
-    output, so this should not occur in practice via the normal pipeline.
+    item somehow appears twice within one list, only its first (best-ranked)
+    occurrence counts towards that list's contribution -- the later repeat
+    is skipped rather than adding a second contribution. Upstream callers
+    (VectorSearch, BM25Search) already dedupe their own output, so this is
+    a defensive guard rather than something expected to occur in practice.
     """
     a = _result("a.py")
     b = _result("b.py")
-    fused = reciprocal_rank_fusion([[a, b, a]])  # a at rank 1 and rank 3
+    fused = reciprocal_rank_fusion([[a, b, a]])  # a at rank 1, repeated at rank 3
     by_path = {r.file_path: r.score for r in fused}
-    expected_a = 1 / 61 + 1 / 63  # both occurrences counted
+    expected_a = 1 / 61  # only the first occurrence (rank 1) counts
+    expected_b = 1 / 62  # b's rank is unaffected by a's later repeat
     assert math.isclose(by_path["a.py"], expected_a, rel_tol=1e-9)
+    assert math.isclose(by_path["b.py"], expected_b, rel_tol=1e-9)
 
 
-def test_items_with_colliding_identity_key_are_merged_even_if_distinct() -> None:
-    """Two genuinely different results sharing (file_path, start, end) merge into one.
+def test_duplicate_across_different_lists_is_still_counted_once_per_list() -> None:
+    """Deduping is per-list only -- the same item legitimately appearing in
+    multiple different lists still gets credit from each of them."""
+    a = _result("a.py")
+    fused = reciprocal_rank_fusion([[a], [a]])
+    expected = 1 / 61 + 1 / 61
+    assert math.isclose(fused[0].score, expected, rel_tol=1e-9)
 
-    This is a known limitation of keying identity on
-    ``(file_path, start_line, end_line)``: malformed or synthetic results
-    (e.g. graph nodes with no resolvable file location) that all carry
-    empty/None location fields will collide and be treated as "the same
-    item" even though they represent different symbols. This mirrors the
-    same identity assumption already made by
-    ``VectorSearch.search``'s own dedup step.
+
+def test_distinct_location_less_results_are_not_merged() -> None:
+    """Two genuinely different results with no location info stay distinct.
+
+    Malformed or synthetic results (e.g. graph nodes with no resolvable
+    file location) that all carry empty/None location fields fall back to
+    a content-hash identity (symbol_name + chunk_text) instead of colliding
+    on a shared ``("", None, None)`` key, so different content is never
+    silently merged just because both are missing a location.
     """
     x = _result("", start_line=None, end_line=None, chunk_text="def foo(): pass")
     y = _result("", start_line=None, end_line=None, chunk_text="def bar(): pass")
     fused = reciprocal_rank_fusion([[x], [y]])
-    assert len(fused) == 1  # merged despite being different symbols
+    assert len(fused) == 2
+    assert {r.chunk_text for r in fused} == {"def foo(): pass", "def bar(): pass"}
+
+
+def test_identical_location_less_results_are_still_merged() -> None:
+    """Two location-less results with the SAME content are correctly recognized
+    as the same item and merged (the content-hash fallback isn't a blanket
+    "never merge" rule -- it only stops *distinct* content from colliding)."""
+    x = _result(
+        "",
+        start_line=None,
+        end_line=None,
+        symbol_name="foo",
+        chunk_text="def foo(): pass",
+    )
+    y = _result(
+        "",
+        start_line=None,
+        end_line=None,
+        symbol_name="foo",
+        chunk_text="def foo(): pass",
+    )
+    fused = reciprocal_rank_fusion([[x], [y]])
+    assert len(fused) == 1
+    expected = 1 / 61 + 1 / 61
+    assert math.isclose(fused[0].score, expected, rel_tol=1e-9)
 
 
 def test_representative_tie_break_prefers_first_list_when_chunk_text_equal() -> None:
