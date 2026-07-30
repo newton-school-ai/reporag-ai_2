@@ -96,8 +96,8 @@ def _validate_inputs(
             )
         validated.append(lst)
 
-    if k < 0:
-        raise ValueError(f"RRF constant k must be >= 0, got {k!r}.")
+    if k <= 0:
+        raise ValueError(f"RRF constant k must be > 0, got {k!r}.")
 
     if top_k is not None:
         if top_k < 1:
@@ -147,7 +147,8 @@ def reciprocal_rank_fusion(
         k: The RRF smoothing constant. Larger *k* dampens the advantage of
             being ranked first and gives deeper lists more equal weight.
             Defaults to ``60`` (the value in the original RRF paper and
-            ``settings.rrf_constant``). Must be ``>= 0``.
+            ``settings.rrf_constant``). Must be ``>= 1`` (a non-positive *k*
+            would make ``1 / (k + rank)`` undefined or negative for rank 1).
         top_k: If given, return at most this many fused results. ``None``
             (the default) returns the **full** fused ranking so a downstream
             cross-encoder reranker can slice ``fused[:20]`` as in the issue
@@ -164,7 +165,7 @@ def reciprocal_rank_fusion(
         returns every item that appeared in at least one input list.
 
     Raises:
-        ValueError: If *k* is negative or *top_k* (when given) is ``< 1``.
+        ValueError: If *k* is ``<= 0`` or *top_k* (when given) is ``< 1``.
         TypeError: If an element of *ranked_lists* is not a list.
 
     Example:
@@ -203,18 +204,6 @@ def reciprocal_rank_fusion(
             if key in seen_in_list:
                 continue
             seen_in_list.add(key)
-            if k == 0 and position == 0:
-                # 1 / (0 + 0) is undefined; guard the degenerate k=0,
-                # rank=1 case. The published RRF formula is only defined
-                # for k >= 1 in practice, but we accept k=0 for items
-                # beyond rank 1 (which produce a finite score) to stay
-                # liberal in what we accept. Skip a rank-1 item under k=0
-                # rather than dividing by zero.
-                logger.warning(
-                    "RRF with k=0 applied to a rank-1 item skips that "
-                    "item to avoid division by zero."
-                )
-                continue
             rank = position + 1  # ranks are 1-based.
             contribution = 1.0 / (k + rank)
             rrf_score[key] = rrf_score.get(key, 0.0) + contribution

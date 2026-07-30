@@ -265,9 +265,19 @@ class TestNonMutation:
 
 
 class TestValidation:
-    def test_negative_k_raises(self) -> None:
-        with pytest.raises(ValueError, match="k must be >= 0"):
+    def test_non_positive_k_raises(self) -> None:
+        """k must be >= 1: a non-positive k makes 1/(k+rank) undefined or
+        negative for rank 1 (k=0 -> division by zero; k<0 -> negative score,
+        which inverts the ranking). Both are rejected."""
+        with pytest.raises(ValueError, match="k must be > 0"):
+            reciprocal_rank_fusion([[_r("a.py", 1)]], k=0)
+        with pytest.raises(ValueError, match="k must be > 0"):
             reciprocal_rank_fusion([[_r("a.py", 1)]], k=-1)
+
+    def test_k_one_is_allowed(self) -> None:
+        """k=1 is the smallest valid value: 1/(1+1) for a rank-1 item."""
+        fused = reciprocal_rank_fusion([[_r("a.py", 1)]], k=1)
+        assert fused[0].score == pytest.approx(1 / 2)
 
     def test_top_k_zero_raises(self) -> None:
         with pytest.raises(ValueError, match="top_k must be >= 1"):
@@ -284,15 +294,6 @@ class TestValidation:
         assert reciprocal_rank_fusion([], k=60) == []
         assert reciprocal_rank_fusion([[]], k=60) == []
         assert reciprocal_rank_fusion([[], [], []], k=60) == []
-
-    def test_k_zero_rank_one_item_skipped_to_avoid_div_by_zero(self) -> None:
-        """k=0 with a rank-1 item would divide by zero; it gets skipped."""
-        items = [_r("a.py", 1), _r("b.py", 1)]
-        fused = reciprocal_rank_fusion([items], k=0)
-        # rank 1 item (a.py) is skipped -> only b.py (rank 2, 1/(0+2)=0.5).
-        assert len(fused) == 1
-        assert fused[0].file_path == "b.py"
-        assert fused[0].score == pytest.approx(1 / 2)
 
     def test_bare_list_coerced_to_single_list(self) -> None:
         """A single list passed without the outer wrapper is accepted."""
