@@ -103,6 +103,16 @@ class Settings(BaseSettings):
     rerank_top_k: int = 10
     rrf_constant: int = 60
 
+    # --- Agentic planner ---
+    # Below this confidence the query classifier falls back to multi-hop
+    # (the safest default -- decomposition is correct for both genuinely
+    # multi-hop queries and ambiguous ones).
+    query_classifier_confidence_threshold: float = 0.6
+    # When True the classifier tries the LLM first, falling back to the
+    # rule-based classifier on any failure. When False only the rule-based
+    # classifier runs (useful in tests / offline / no-API-key scenarios).
+    query_classifier_use_llm: bool = True
+
     # --- Ingestion ---
     max_repo_size_mb: int = 500
     clone_depth: int = 1
