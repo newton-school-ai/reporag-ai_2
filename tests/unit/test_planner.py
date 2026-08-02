@@ -41,15 +41,11 @@ class TestQueryClassifier:
     @pytest.mark.parametrize(
         "query, expected_type, confidence",
         [
-            (
-                "Where is the authenticate function defined?",
-                QueryType.SIMPLE_LOOKUP,
-                0.95,
-            ),
+            ("Where is authenticate defined?", QueryType.SIMPLE_LOOKUP, 0.95),
             ("Where is X defined?", QueryType.SIMPLE_LOOKUP, 0.90),
             ("Show me the auth middleware.", QueryType.SIMPLE_LOOKUP, 0.85),
+            ("How does auth work end-to-end?", QueryType.MULTI_HOP, 0.92),
             ("How does a request go from API to DB?", QueryType.MULTI_HOP, 0.92),
-            ("How does the auth flow work end-to-end?", QueryType.MULTI_HOP, 0.88),
             ("What calls function Y?", QueryType.MULTI_HOP, 0.91),
             (
                 "Explain the architecture of the ingestion pipeline.",
@@ -77,7 +73,7 @@ class TestQueryClassifier:
     def test_low_confidence_fallback(self) -> None:
         """If confidence is below threshold, it must fallback to multi-hop."""
         mock_client = make_mock_llm({"query_type": "simple-lookup", "confidence": 0.45})
-        classifier = QueryClassifier(llm_client=mock_client, fallback_threshold=0.7)
+        classifier = QueryClassifier(llm_client=mock_client)
 
         result = classifier.classify("Tell me about the code")
         # Overridden by fallback

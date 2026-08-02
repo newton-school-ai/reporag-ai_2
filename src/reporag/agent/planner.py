@@ -27,14 +27,14 @@ class QueryType(StrEnum):
 
 
 @dataclass(frozen=True)
-class ClassificationResult:
+class Classification:
     """The result of query classification."""
 
     query_type: QueryType
     confidence: float
 
 
-_CLASSIFIER_PROMPT = """You are an expert query classifier for a code repository RAG system.
+CLASSIFY_PROMPT = """You are an expert query classifier for a code repository RAG system.
 Your job is to classify the user's software engineering query into exactly one of three categories:
 - "simple-lookup": The user wants to locate a specific definition, class, file, or exact symbol (e.g., "Where is X defined?", "Show me the auth middleware.").
 - "multi-hop": The user asks a structural, tracing, or "how does it work" question that requires combining multiple pieces of code (e.g., "How does a request go from API to DB?", "What calls function Y?").
@@ -46,10 +46,10 @@ You must return ONLY valid JSON matching this schema:
 Do not include markdown code blocks. Do not include any explanations.
 
 Examples:
-User: "Where is the authenticate function defined?"
+User: "Where is authenticate defined?"
 {{"query_type": "simple-lookup", "confidence": 0.95}}
 
-User: "How does the auth flow work end-to-end?"
+User: "How does auth work end-to-end?"
 {{"query_type": "multi-hop", "confidence": 0.92}}
 
 User: "Explain the architecture"
@@ -72,7 +72,7 @@ class QueryClassifier:
     def __init__(
         self,
         llm_client: Any | None = None,
-        fallback_threshold: float = 0.7,
+        fallback_threshold: float = 0.6,
     ) -> None:
         self.fallback_threshold = fallback_threshold
         self._llm_client = llm_client
@@ -97,14 +97,14 @@ class QueryClassifier:
                 api_key=settings.openai_api_key.get_secret_value()
             )
 
-    def classify(self, query: str) -> ClassificationResult:
+    def classify(self, query: str) -> Classification:
         """Classify a query into a QueryType with a confidence score."""
         query = query.strip()
         if not query:
-            return ClassificationResult(QueryType.MULTI_HOP, 0.0)
+            return Classification(QueryType.MULTI_HOP, 0.0)
 
         self._ensure_loaded()
-        prompt = _CLASSIFIER_PROMPT.format(query=query)
+        prompt = CLASSIFY_PROMPT.format(query=query)
 
         try:
             raw_response = self._invoke_llm(prompt)
@@ -119,7 +119,7 @@ class QueryClassifier:
                 "Query classification failed (%s). Falling back to multi-hop.",
                 type(e).__name__,
             )
-            return ClassificationResult(QueryType.MULTI_HOP, 0.0)
+            return Classification(QueryType.MULTI_HOP, 0.0)
 
     def _invoke_llm(self, prompt: str) -> str:
         """Call the underlying LLM client."""
@@ -160,7 +160,7 @@ class QueryClassifier:
 
         raise RuntimeError("Unsupported llm_client type")
 
-    def _parse_response(self, text: str) -> ClassificationResult:
+    def _parse_response(self, text: str) -> Classification:
         """Parse the JSON output and handle threshold fallbacks."""
         data = json.loads(text.strip())
 
@@ -174,9 +174,9 @@ class QueryClassifier:
                 confidence,
                 self.fallback_threshold,
             )
-            return ClassificationResult(QueryType.MULTI_HOP, 0.0)
+            return Classification(QueryType.MULTI_HOP, 0.0)
 
-        return ClassificationResult(query_type, confidence)
+        return Classification(query_type, confidence)
 
 
 # TODO: Implement in Issue 21
