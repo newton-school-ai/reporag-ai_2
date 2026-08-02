@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from reporag.config import settings
@@ -18,7 +18,7 @@ from reporag.config import settings
 logger = logging.getLogger(__name__)
 
 
-class QueryType(str, Enum):
+class QueryType(StrEnum):
     """Categories of queries supported by the agentic pipeline."""
 
     SIMPLE_LOOKUP = "simple-lookup"
