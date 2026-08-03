@@ -58,7 +58,7 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 from reporag.config import settings
 
@@ -635,3 +635,500 @@ def _is_unset_secret(secret: Any) -> bool:
         "sk-your-key-here",
         "sk-ant-your-key-here",
     }
+
+
+# ============================================================================
+# QueryDecomposer Section (Issue 21)
+# ============================================================================
+
+
+AnswerType = Literal["code", "explanation", "list"]
+
+
+@dataclass(frozen=True)
+class SubQuery:
+    """An atomic query step to be run against the codebase."""
+
+    id: str
+    query: str = ""
+    expected_answer_type: AnswerType = "explanation"
+    depends_on: tuple[str, ...] = ()
+    text: str = ""
+    context_from: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.query and self.text:
+            object.__setattr__(self, "query", self.text)
+        elif self.query and not self.text:
+            object.__setattr__(self, "text", self.query)
+
+        if not self.depends_on and self.context_from:
+            object.__setattr__(self, "depends_on", self.context_from)
+        elif self.depends_on and not self.context_from:
+            object.__setattr__(self, "context_from", self.depends_on)
+
+
+@dataclass(frozen=True)
+class DecompositionPlan:
+    """An ordered list of sub-queries to retrieve the answer to a complex query."""
+
+    original_query: str
+    steps: tuple[SubQuery, ...]
+    source: Literal["llm", "rules"]
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class DecompositionState(TypedDict):
+    """LangGraph execution state for QueryDecomposer."""
+
+    query: str
+    repo_context: dict[str, Any]
+    prompt: str
+    raw_response: str
+    steps: list[dict[str, Any]]
+    source: Literal["llm", "rules"]
+    error: str | None
+
+
+# ---------------------------------------------------------------------------
+# Prompt Construction & Parsing
+# ---------------------------------------------------------------------------
+
+
+def _build_decomposition_prompt(
+    query: str, repo_context: dict[str, Any] | None = None
+) -> str:
+    """Build a few-shot prompt instructing the LLM to return structured steps."""
+    context_str = ""
+    if repo_context:
+        if "modules" in repo_context:
+            context_str += f"Available modules: {repo_context['modules']}\n"
+        if "symbols" in repo_context:
+            context_str += f"Key symbols: {repo_context['symbols']}\n"
+
+    return (
+        "You are an expert query decomposer for a code repository.\n"
+        "Your task is to break down a complex, multi-hop user query into a sequence of 2-5 ordered sub-queries.\n"
+        "If a query is simple and does not need decomposition, return a single sub-query.\n"
+        "\n"
+        "Use the repository context (available modules, key symbols) to construct query steps that target specific parts of the codebase.\n"
+        "Identify dependencies between steps: a step should depend on prior steps if it requires their retrieved context to proceed.\n"
+        "\n"
+        "Repository Context:\n"
+        f"{context_str or 'None'}\n"
+        "\n"
+        "Format the output as a strict JSON list of objects, with no markdown formatting or explanation. Each object must have:\n"
+        '- "id": unique identifier (e.g. "step_1")\n'
+        '- "query": the sub-query string targeting a specific search or lookup\n'
+        '- "expected_answer_type": "code" (for files/symbols/definitions), "explanation" (for flow/architecture), or "list"\n'
+        '- "depends_on": list of step IDs this step depends on (e.g. ["step_1"])\n'
+        "\n"
+        "Example 1 (Multi-hop):\n"
+        "Query: How does a request go from the API endpoint to the database?\n"
+        "Repository Context: modules=['api', 'routes', 'db', 'models']\n"
+        "Response:\n"
+        "[\n"
+        '  {"id": "step_1", "query": "Find where API endpoints are defined in the api or routes modules.", "expected_answer_type": "code", "depends_on": []},\n'
+        '  {"id": "step_2", "query": "Find how database queries or connections are made in the db or models modules.", "expected_answer_type": "code", "depends_on": []},\n'
+        '  {"id": "step_3", "query": "Trace the flow from the API endpoint handling to the database connection/query execution.", "expected_answer_type": "explanation", "depends_on": ["step_1", "step_2"]}\n'
+        "]\n"
+        "\n"
+        "Example 2 (Simple lookup):\n"
+        "Query: Where is the authenticate function defined?\n"
+        "Repository Context: modules=['auth', 'utils']\n"
+        "Response:\n"
+        "[\n"
+        '  {"id": "step_1", "query": "Find the definition of the authenticate function in the auth or utils modules.", "expected_answer_type": "code", "depends_on": []}\n'
+        "]\n"
+        "\n"
+        "Now decompose this query:\n"
+        f"Query: {query}\n"
+    )
+
+
+def parse_decomposition_response(raw: str) -> list[dict[str, Any]]:
+    """Parse the raw JSON response from the LLM containing a list of sub-queries."""
+    if not raw or not raw.strip():
+        raise ValueError("Empty response")
+
+    # Tolerant parsing: find the JSON list
+    match = re.search(r"\[\s*\{.*\}\s*\]", raw, re.DOTALL)
+    text = match.group(0) if match else raw.strip()
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON: {exc}") from exc
+
+    if not isinstance(data, list):
+        if isinstance(data, dict):
+            data = [data]
+        else:
+            raise ValueError("Expected a list of sub-queries")
+
+    parsed_steps = []
+    for step in data:
+        if not isinstance(step, dict):
+            continue
+
+        step_id = str(step.get("id", "")).strip()
+        query_text = str(step.get("query", "")).strip()
+        ans_type = str(step.get("expected_answer_type", "explanation")).strip().lower()
+        if ans_type not in ("code", "explanation", "list"):
+            ans_type = "explanation"
+
+        raw_deps = step.get("depends_on") or step.get("context_from") or []
+        if isinstance(raw_deps, str):
+            deps = [d.strip() for d in raw_deps.split(",") if d.strip()]
+        elif isinstance(raw_deps, list):
+            deps = [str(d).strip() for d in raw_deps if str(d).strip()]
+        else:
+            deps = []
+
+        if not step_id or not query_text:
+            continue
+
+        parsed_steps.append(
+            {
+                "id": step_id,
+                "query": query_text,
+                "expected_answer_type": ans_type,
+                "depends_on": deps,
+            }
+        )
+
+    if not parsed_steps:
+        raise ValueError("No valid sub-queries parsed")
+
+    return parsed_steps
+
+
+# ---------------------------------------------------------------------------
+# Rule-based fallback decomposition (pure, deterministic, unit-testable)
+# ---------------------------------------------------------------------------
+
+
+def rule_based_decompose(
+    query: str, repo_context: dict[str, Any] | None = None
+) -> list[SubQuery]:
+    """Fallback query decomposition using rule-based keyword heuristics."""
+    classification = rule_based_classify(query)
+
+    if classification.query_type == "simple-lookup":
+        return [
+            SubQuery(
+                id="step_1",
+                query=f"Find the definition and references for: {query}",
+                expected_answer_type="code",
+                depends_on=(),
+            )
+        ]
+
+    modules = repo_context.get("modules", []) if repo_context else []
+    symbols = repo_context.get("symbols", []) if repo_context else []
+
+    matched_modules = []
+    for m in modules:
+        if m.lower() in query.lower():
+            matched_modules.append(m)
+
+    matched_symbols = []
+    for s in symbols:
+        if s.lower() in query.lower():
+            matched_symbols.append(s)
+
+    # Heuristic flow when 2+ modules are detected in query
+    if len(matched_modules) >= 2:
+        mod_1 = matched_modules[0]
+        mod_2 = matched_modules[1]
+        return [
+            SubQuery(
+                id="step_1",
+                query=f"Analyze components, endpoints, or functions related to {mod_1}.",
+                expected_answer_type="code",
+                depends_on=(),
+            ),
+            SubQuery(
+                id="step_2",
+                query=f"Analyze components, schemas, or query execution related to {mod_2}.",
+                expected_answer_type="code",
+                depends_on=(),
+            ),
+            SubQuery(
+                id="step_3",
+                query=f"Trace the logic path and execution flow from {mod_1} to {mod_2} in the query: '{query}'.",
+                expected_answer_type="explanation",
+                depends_on=("step_1", "step_2"),
+            ),
+        ]
+
+    # Heuristic flow when 2+ symbols are detected in query
+    if len(matched_symbols) >= 2:
+        sym_1 = matched_symbols[0]
+        sym_2 = matched_symbols[1]
+        return [
+            SubQuery(
+                id="step_1",
+                query=f"Find definitions and trace callers/callees of symbol: '{sym_1}'.",
+                expected_answer_type="code",
+                depends_on=(),
+            ),
+            SubQuery(
+                id="step_2",
+                query=f"Find definitions and trace callers/callees of symbol: '{sym_2}'.",
+                expected_answer_type="code",
+                depends_on=(),
+            ),
+            SubQuery(
+                id="step_3",
+                query=f"Determine how token flows or call relationships link '{sym_1}' and '{sym_2}'.",
+                expected_answer_type="explanation",
+                depends_on=("step_1", "step_2"),
+            ),
+        ]
+
+    # General fallback flow (3 steps)
+    step_1_query = "Identify initial components and entry points related to the query."
+    if matched_modules:
+        step_1_query = f"Identify entry points and definitions in the '{', '.join(matched_modules)}' modules."
+    elif matched_symbols:
+        step_1_query = f"Locate definitions and references for symbol(s): {', '.join(matched_symbols)}."
+
+    return [
+        SubQuery(
+            id="step_1",
+            query=step_1_query,
+            expected_answer_type="code",
+            depends_on=(),
+        ),
+        SubQuery(
+            id="step_2",
+            query="Analyze downstream components, helper functions, or databases connected to the entry points.",
+            expected_answer_type="code",
+            depends_on=("step_1",),
+        ),
+        SubQuery(
+            id="step_3",
+            query=f"Trace the end-to-end execution flow and explain the relationship for the query: '{query}'.",
+            expected_answer_type="explanation",
+            depends_on=("step_1", "step_2"),
+        ),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# QueryDecomposer Class
+# ---------------------------------------------------------------------------
+
+
+class QueryDecomposer:
+    """Decomposes complex query into ordered sub-queries using a LangGraph state machine.
+
+    Includes lazy loading, deterministic fallback, and maximum step limits.
+    """
+
+    def __init__(
+        self,
+        llm: LLMCallable | None = None,
+        *,
+        max_steps: int | None = None,
+        use_llm: bool | None = None,
+    ) -> None:
+        if max_steps is None:
+            max_steps = settings.query_decomposer_max_steps
+        if max_steps < 1:
+            raise ValueError(f"max_steps must be >= 1, got {max_steps!r}.")
+        self.max_steps = max_steps
+        self.use_llm = (
+            use_llm if use_llm is not None else settings.query_classifier_use_llm
+        )
+        self._resolved_llm = llm
+        self._loaded = False
+
+        from langgraph.graph import END, START, StateGraph
+
+        workflow = StateGraph(DecompositionState)
+        workflow.add_node("build_prompt", self._node_build_prompt)
+        workflow.add_node("call_llm", self._node_call_llm)
+        workflow.add_node("parse_response", self._node_parse_response)
+        workflow.add_node("rule_based", self._node_rule_based)
+
+        workflow.add_edge(START, "build_prompt")
+        workflow.add_edge("build_prompt", "call_llm")
+        workflow.add_edge("call_llm", "parse_response")
+
+        workflow.add_conditional_edges(
+            "parse_response",
+            self._router,
+            {"rule_based": "rule_based", END: END},
+        )
+        workflow.add_edge("rule_based", END)
+
+        self._graph = workflow.compile()
+
+    def _ensure_loaded(self) -> LLMCallable | None:
+        if self._loaded:
+            return self._resolved_llm
+
+        if self._resolved_llm is None:
+            api_key = settings.active_llm_api_key
+            if _is_unset_secret(api_key):
+                logger.warning(
+                    "QueryDecomposer: LLM is enabled but no API key is "
+                    "configured for provider '%s'; falling back to rule-based "
+                    "classification.",
+                    settings.llm_provider,
+                )
+                self._loaded = True
+                return None
+
+            self._resolved_llm = QueryClassifier._build_langchain_llm()
+
+        self._loaded = True
+        return self._resolved_llm
+
+    def _node_build_prompt(self, state: DecompositionState) -> dict[str, Any]:
+        prompt = _build_decomposition_prompt(state["query"], state.get("repo_context"))
+        return {"prompt": prompt}
+
+    def _node_call_llm(self, state: DecompositionState) -> dict[str, Any]:
+        if not self.use_llm:
+            return {"error": "LLM disabled"}
+        llm = self._ensure_loaded()
+        if llm is None:
+            return {"error": "LLM not configured"}
+        try:
+            raw_response = llm(state["prompt"])
+            return {"raw_response": raw_response}
+        except Exception as exc:
+            logger.warning("QueryDecomposer: LLM call failed (%s)", exc)
+            return {"error": f"LLM call failed: {exc}"}
+
+    def _node_parse_response(self, state: DecompositionState) -> dict[str, Any]:
+        raw = state.get("raw_response", "")
+        try:
+            steps = parse_decomposition_response(raw)
+            if _has_dependency_cycle(steps):
+                raise ValueError(
+                    "Dependency cycle detected in LLM-generated sub-queries."
+                )
+            return {"steps": steps, "source": "llm", "error": None}
+        except Exception as exc:
+            logger.warning("QueryDecomposer: failed to parse response (%s)", exc)
+            return {"error": f"Parse error: {exc}"}
+
+    def _node_rule_based(self, state: DecompositionState) -> dict[str, Any]:
+        steps = rule_based_decompose(state["query"], state.get("repo_context"))
+        step_dicts = [
+            {
+                "id": s.id,
+                "query": s.query,
+                "expected_answer_type": s.expected_answer_type,
+                "depends_on": list(s.depends_on),
+            }
+            for s in steps
+        ]
+        return {"steps": step_dicts, "source": "rules"}
+
+    def _router(self, state: DecompositionState) -> str:
+        from langgraph.graph import END
+
+        if state.get("error") is not None:
+            return "rule_based"
+        return END
+
+    def decompose(
+        self, query: str, repo_context: dict[str, Any] | None = None
+    ) -> DecompositionPlan:
+        """Decompose a query into a sequence of sub-queries.
+
+        Args:
+            query: The user query string.
+            repo_context: Dictionary containing available modules and key symbols.
+
+        Returns:
+            A DecompositionPlan containing the steps of sub-queries.
+
+        Raises:
+            ValueError: If the query is empty or whitespace-only.
+        """
+        if not query or not query.strip():
+            raise ValueError("query must be a non-empty string.")
+
+        initial_state: DecompositionState = {
+            "query": query,
+            "repo_context": repo_context or {},
+            "prompt": "",
+            "raw_response": "",
+            "steps": [],
+            "source": "rules",
+            "error": None,
+        }
+
+        final_state = self._graph.invoke(initial_state)
+
+        # Extract steps
+        step_dicts = final_state.get("steps") or []
+
+        # Clamp/trim to max_steps
+        if len(step_dicts) > self.max_steps:
+            step_dicts = step_dicts[: self.max_steps]
+
+        # Fix dependency chains: remove pruned step IDs and self-references
+        valid_ids = {s["id"] for s in step_dicts}
+        steps = []
+        for s in step_dicts:
+            deps = tuple(
+                d for d in s.get("depends_on", []) if d in valid_ids and d != s["id"]
+            )
+            steps.append(
+                SubQuery(
+                    id=s["id"],
+                    query=s["query"],
+                    expected_answer_type=s["expected_answer_type"],
+                    depends_on=deps,
+                )
+            )
+
+        return DecompositionPlan(
+            original_query=query,
+            steps=tuple(steps),
+            source=final_state.get("source", "rules"),
+            metadata={
+                "raw_response": final_state.get("raw_response", ""),
+                "error": final_state.get("error"),
+            },
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"QueryDecomposer(use_llm={self.use_llm}, "
+            f"max_steps={self.max_steps}, "
+            f"loaded={self._loaded})"
+        )
+
+
+def _has_dependency_cycle(steps: list[dict[str, Any]]) -> bool:
+    """Return True if there is a dependency cycle among the steps (DFS colour-mark).
+
+    Self-references (a step depending on itself) are ignored here because they
+    are filtered out separately during plan construction; this function focuses
+    on non-trivial cycles like A->B->A.
+    """
+    adj = {s["id"]: s.get("depends_on", []) for s in steps}
+    visited: dict[str, int] = {}  # 0 = unvisited, 1 = visiting, 2 = done
+
+    def _dfs(node: str) -> bool:
+        visited[node] = 1
+        for neighbour in adj.get(node, []):
+            if neighbour == node:
+                continue  # ignore self-loops
+            colour = visited.get(neighbour, 0)
+            if colour == 1:
+                return True  # back-edge: cycle detected
+            if colour == 0 and _dfs(neighbour):
+                return True
+        visited[node] = 2
+        return False
+
+    return any(_dfs(n) for n in adj if visited.get(n, 0) == 0)
