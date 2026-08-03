@@ -466,6 +466,47 @@ class TestRuleBasedDecompose:
         assert "relevant context: api" in steps[0].query
         assert "relevant context: db" in steps[1].query
 
+    def test_three_hop_chain_gets_a_locate_step_per_endpoint(self) -> None:
+        """A chain with more than one "to" must not fold the extra hop
+        into a single endpoint label -- each endpoint gets its own step."""
+        steps = rule_based_decompose(
+            "How do I trace data from source to destination to sink?",
+            {"modules": ["source", "sink"], "symbols": []},
+        )
+        assert len(steps) == 4
+        assert validate_steps(steps) is None
+        assert steps[0].query.startswith("Locate source")
+        assert steps[1].query.startswith("Locate destination")
+        assert steps[2].query.startswith("Locate sink")
+        assert steps[3].depends_on == ("step-1", "step-2", "step-3")
+        assert "source" in steps[3].query
+        assert "destination" in steps[3].query
+        assert "sink" in steps[3].query
+
+    def test_four_hop_chain_still_fits_within_five_steps(self) -> None:
+        steps = rule_based_decompose(
+            "Trace the flow from A to B to C to D.", {"modules": [], "symbols": []}
+        )
+        assert len(steps) == 5  # 4 locate steps + 1 trace step
+        assert validate_steps(steps) is None
+        assert steps[4].depends_on == ("step-1", "step-2", "step-3", "step-4")
+
+    def test_five_hop_chain_falls_back_to_generic_template(self) -> None:
+        """A chain too long to fit in 5 steps degrades to the generic
+        3-step template rather than producing an invalid (>5 step) plan."""
+        steps = rule_based_decompose(
+            "from A to B to C to D to E", {"modules": [], "symbols": []}
+        )
+        assert len(steps) == 3
+        assert validate_steps(steps) is None
+
+    def test_from_with_no_to_is_not_treated_as_a_chain(self) -> None:
+        steps = rule_based_decompose(
+            "Copy files from the backup directory.", {"modules": [], "symbols": []}
+        )
+        assert len(steps) == 3  # generic template, not a from/to chain
+        assert validate_steps(steps) is None
+
     def test_generic_pattern_used_when_no_from_to(self) -> None:
         steps = rule_based_decompose(
             "How does the auth flow work end-to-end?",

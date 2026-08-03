@@ -1037,12 +1037,16 @@ def _build_decomposition_prompt(query: str, repo_context: dict[str, list[str]]) 
 # Rule-based decomposer (pure, network-free, unit-testable)
 # ---------------------------------------------------------------------------
 
-# Matches an explicit "from A to B" flow description -- the clearest
-# possible signal for a 2-endpoint trace, and exactly the phrasing used in
-# the issue's own example query.
-_FROM_TO_RE = re.compile(
-    r"\bfrom\s+(?:the\s+)?(.+?)\s+to\s+(?:the\s+)?(.+?)[\?\.]*$", re.IGNORECASE
-)
+# Matches an explicit "from A to B [to C ...]" flow description and
+# captures everything after "from " up to the end of the query. The chain
+# is split into individual endpoints by ``_TO_SPLIT_RE`` below, so a query
+# naming 2, 3, or 4 endpoints (e.g. "from source to destination to sink")
+# gets one locate step per endpoint rather than only the first and last.
+_FROM_RE = re.compile(r"\bfrom\s+(?:the\s+)?(.+)$", re.IGNORECASE)
+
+# Splits the captured "from ..." remainder on each "to" -- this is what
+# turns a 3+ hop chain into separate endpoints instead of one blob.
+_TO_SPLIT_RE = re.compile(r"\s+to\s+(?:the\s+)?", re.IGNORECASE)
 
 # Boilerplate stripped from a query to leave just the "subject" -- used to
 # phrase generic fallback sub-queries naturally (e.g. "How does the auth
@@ -1061,6 +1065,36 @@ def _extract_subject(query: str) -> str:
     return subject or query.strip()
 
 
+def _split_from_to_chain(query: str) -> list[str] | None:
+    """Split a ``"from A to B [to C ...]"`` query into its ordered endpoints.
+
+    Handles chains of any length, not just a single "A to B" pair: "from
+    source to destination to sink" splits into three endpoints
+    (``["source", "destination", "sink"]``), each of which gets its own
+    locate step in :func:`rule_based_decompose` rather than the extra hop
+    being folded into one endpoint's label.
+
+    Args:
+        query: The natural-language query to inspect.
+
+    Returns:
+        The ordered list of endpoint strings if the query contains a
+        ``"from ... to ..."`` chain with at least two endpoints, otherwise
+        ``None`` (no "from", or "from" with no "to" at all).
+    """
+    match = _FROM_RE.search(query)
+    if match is None:
+        return None
+    remainder = match.group(1).rstrip("?.")
+    endpoints = [
+        segment.strip().rstrip("?.") for segment in _TO_SPLIT_RE.split(remainder)
+    ]
+    endpoints = [endpoint for endpoint in endpoints if endpoint]
+    if len(endpoints) < 2:
+        return None
+    return endpoints
+
+
 def rule_based_decompose(
     query: str, repo_context: dict[str, list[str]] | None = None
 ) -> list[DecompositionStep]:
@@ -1068,15 +1102,20 @@ def rule_based_decompose(
 
     This is the network-free fallback, used when the LLM is disabled, no
     API key is configured, or an LLM-produced plan fails validation after
-    retries. It always returns a valid 3-step plan (never fails validation
+    retries. It always returns a valid plan (never fails validation
     itself), so :meth:`QueryDecomposer.decompose` never raises for a
     well-formed, non-empty query.
 
     Two shapes are handled:
 
-    * An explicit ``"... from A to B ..."`` flow -- split into "locate A",
-      "locate B", and "trace A -> B" (mirrors the issue's own example
-      query almost exactly).
+    * An explicit ``"... from A to B [to C ...] ..."`` flow -- one "locate"
+      step per endpoint (2 to 4 of them), plus one "trace" step depending
+      on all of them. A 2-endpoint chain mirrors the issue's own example
+      query almost exactly; a longer chain (e.g. "from source to
+      destination to sink") gets a locate step *per hop* rather than
+      folding everything past the first "to" into one endpoint label. A
+      chain of more than 4 endpoints would need more than 5 steps total,
+      so it falls through to the generic shape below instead.
     * Everything else -- a generic "identify entry point", "retrieve
       implementation", "explain end-to-end" template built around the
       query's core subject.
@@ -1092,35 +1131,41 @@ def rule_based_decompose(
             :func:`_normalize_repo_context`); ``None`` is treated as empty.
 
     Returns:
-        A list of 3 :class:`DecompositionStep` objects with valid,
+        A list of :class:`DecompositionStep` objects (3 for the generic
+        shape, or ``len(endpoints) + 1`` for a from/to chain) with valid,
         backward-only dependency edges.
     """
     repo_context = repo_context or {"modules": [], "symbols": []}
 
-    match = _FROM_TO_RE.search(query)
-    if match:
-        start, end = match.group(1).strip(), match.group(2).strip()
-        return [
+    endpoints = _split_from_to_chain(query)
+    if endpoints is not None and 2 <= len(endpoints) <= 4:
+        locate_steps = [
             DecompositionStep(
-                id="step-1",
-                query=f"Locate {start}{_grounding_note(start, repo_context)}",
+                id=f"step-{index + 1}",
+                query=f"Locate {endpoint}{_grounding_note(endpoint, repo_context)}",
                 expected_answer_type="code",
                 depends_on=(),
-            ),
-            DecompositionStep(
-                id="step-2",
-                query=f"Locate {end}{_grounding_note(end, repo_context)}",
-                expected_answer_type="code",
-                depends_on=(),
-            ),
-            DecompositionStep(
-                id="step-3",
-                query=f"Trace how {start} connects to {end}",
-                expected_answer_type="explanation",
-                depends_on=("step-1", "step-2"),
-            ),
+            )
+            for index, endpoint in enumerate(endpoints)
         ]
+        if len(endpoints) == 2:
+            trace_query = f"Trace how {endpoints[0]} connects to {endpoints[1]}"
+        else:
+            middle = ", ".join(endpoints[1:-1])
+            trace_query = (
+                f"Trace the path from {endpoints[0]}, through {middle}, "
+                f"to {endpoints[-1]}"
+            )
+        trace_step = DecompositionStep(
+            id=f"step-{len(endpoints) + 1}",
+            query=trace_query,
+            expected_answer_type="explanation",
+            depends_on=tuple(step.id for step in locate_steps),
+        )
+        return [*locate_steps, trace_step]
 
+    # No from/to chain (or one too long to fit in 5 steps) -- fall back to
+    # the generic three-step template built around the query's subject.
     subject = _extract_subject(query)
     return [
         DecompositionStep(
