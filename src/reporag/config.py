@@ -111,6 +111,9 @@ class Settings(BaseSettings):
     # When True the classifier uses the LLM; when False it uses only the
     # rule-based fallback (useful in tests / offline / no-API-key scenarios).
     query_classifier_use_llm: bool = True
+    # Maximum number of sub-queries the decomposer is allowed to produce.
+    # Responses with more steps are trimmed to this limit.
+    query_decomposer_max_steps: int = 5
 
     # --- Ingestion ---
     max_repo_size_mb: int = 500
