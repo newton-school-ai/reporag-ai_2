@@ -318,3 +318,52 @@ def test_multihop_decompositions(query: str, expected_step_count: int) -> None:
     # Verify step dependencies (ordering constraint)
     assert plan.steps[0].depends_on == ()
     assert len(plan.steps[-1].depends_on) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Safety & Hardening Tests
+# ---------------------------------------------------------------------------
+
+
+def test_decomposer_invalid_max_steps_raises() -> None:
+    with pytest.raises(ValueError, match="max_steps must be >= 1"):
+        QueryDecomposer(max_steps=0)
+
+
+def test_decomposer_filters_self_dependencies() -> None:
+    steps_data = [
+        {
+            "id": "step_1",
+            "query": "Q1",
+            "expected_answer_type": "code",
+            "depends_on": ["step_1"],
+        },
+    ]
+    fake_llm = _FakeLLM(json.dumps(steps_data))
+    decomposer = QueryDecomposer(llm=fake_llm, use_llm=True)
+    plan = decomposer.decompose("Find details")
+    assert plan.steps[0].depends_on == ()
+
+
+def test_decomposer_detects_dependency_cycle_and_falls_back() -> None:
+    # LLM returns a plan with cyclic dependency (step_1 depends on step_2, step_2 depends on step_1)
+    steps_data = [
+        {
+            "id": "step_1",
+            "query": "Q1",
+            "expected_answer_type": "code",
+            "depends_on": ["step_2"],
+        },
+        {
+            "id": "step_2",
+            "query": "Q2",
+            "expected_answer_type": "code",
+            "depends_on": ["step_1"],
+        },
+    ]
+    fake_llm = _FakeLLM(json.dumps(steps_data))
+    decomposer = QueryDecomposer(llm=fake_llm, use_llm=True)
+    # On cycle detection, it should fail parsing/validation and fallback to rule_based
+    plan = decomposer.decompose("How does signup connect to email service?")
+    assert plan.source == "rules"
+    assert len(plan.steps) == 3

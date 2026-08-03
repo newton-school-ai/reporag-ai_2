@@ -936,6 +936,8 @@ class QueryDecomposer:
     ) -> None:
         if max_steps is None:
             max_steps = settings.query_decomposer_max_steps
+        if max_steps < 1:
+            raise ValueError(f"max_steps must be >= 1, got {max_steps!r}.")
         self.max_steps = max_steps
         self.use_llm = (
             use_llm if use_llm is not None else settings.query_classifier_use_llm
@@ -1006,6 +1008,10 @@ class QueryDecomposer:
         raw = state.get("raw_response", "")
         try:
             steps = parse_decomposition_response(raw)
+            if _has_dependency_cycle(steps):
+                raise ValueError(
+                    "Dependency cycle detected in LLM-generated sub-queries."
+                )
             return {"steps": steps, "source": "llm", "error": None}
         except Exception as exc:
             logger.warning("QueryDecomposer: failed to parse response (%s)", exc)
@@ -1068,11 +1074,13 @@ class QueryDecomposer:
         if len(step_dicts) > self.max_steps:
             step_dicts = step_dicts[: self.max_steps]
 
-        # Fix dependency chains for remaining steps
+        # Fix dependency chains: remove pruned step IDs and self-references
         valid_ids = {s["id"] for s in step_dicts}
         steps = []
         for s in step_dicts:
-            deps = tuple(d for d in s.get("depends_on", []) if d in valid_ids)
+            deps = tuple(
+                d for d in s.get("depends_on", []) if d in valid_ids and d != s["id"]
+            )
             steps.append(
                 SubQuery(
                     id=s["id"],
@@ -1098,3 +1106,29 @@ class QueryDecomposer:
             f"max_steps={self.max_steps}, "
             f"loaded={self._loaded})"
         )
+
+
+def _has_dependency_cycle(steps: list[dict[str, Any]]) -> bool:
+    """Return True if there is a dependency cycle among the steps (DFS colour-mark).
+
+    Self-references (a step depending on itself) are ignored here because they
+    are filtered out separately during plan construction; this function focuses
+    on non-trivial cycles like A->B->A.
+    """
+    adj = {s["id"]: s.get("depends_on", []) for s in steps}
+    visited: dict[str, int] = {}  # 0 = unvisited, 1 = visiting, 2 = done
+
+    def _dfs(node: str) -> bool:
+        visited[node] = 1
+        for neighbour in adj.get(node, []):
+            if neighbour == node:
+                continue  # ignore self-loops
+            colour = visited.get(neighbour, 0)
+            if colour == 1:
+                return True  # back-edge: cycle detected
+            if colour == 0 and _dfs(neighbour):
+                return True
+        visited[node] = 2
+        return False
+
+    return any(_dfs(n) for n in adj if visited.get(n, 0) == 0)
