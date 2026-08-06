@@ -46,9 +46,36 @@ LLM/model-backed components stay consistent and easy to test:
   correct for both genuinely multi-hop queries and ambiguous ones, while
   a wrong ``simple-lookup`` would skip needed hops).
 
-The :class:`QueryDecomposer` (Issue 21) will be added to this module in a
-later issue; the classifier is implemented first because the decomposer
-consumes its output.
+Decomposer (Issue 21)
+----------------------
+:class:`QueryDecomposer` consumes the classifier's output above.  A
+``multi-hop`` query is broken into 2-5 ordered sub-queries with dependency
+edges (``depends_on``) using an LLM, orchestrated by a small LangGraph state
+machine::
+
+    classify --(simple-lookup / exploratory)--> passthrough --> END
+             --(multi-hop)--------------------> decompose --> validate --(ok)--> END
+                                                     ^             |
+                                                     '---(retry)---+--(exhausted)--> rule_fallback --> END
+
+* ``classify``      -- reuses :class:`QueryClassifier` to decide whether the
+  query needs decomposition at all (mirrors the classifier's own dual
+  LLM/rules strategy, so this also works fully offline).
+* ``passthrough``   -- ``simple-lookup``/``exploratory`` queries are wrapped
+  in a single-step plan (``needs_decomposition=False``) so every downstream
+  consumer (the Issue 22 router/executor) can always iterate ``plan.steps``
+  uniformly, whether or not decomposition happened.
+* ``decompose``     -- prompts the LLM with few-shot examples plus the
+  caller-supplied ``repo_context`` (module names / key symbols) so the
+  sub-queries are grounded in the actual repo rather than generic.
+* ``validate``      -- structurally checks the parsed plan (2-5 steps,
+  unique ids, only-backward dependency edges, a valid
+  ``expected_answer_type``) and retries the LLM once on failure.
+* ``rule_fallback``  -- a deterministic, network-free decomposer (same
+  contract as :func:`rule_based_classify`) used when the LLM is disabled, no
+  API key is configured, or the LLM plan still fails validation after
+  retries -- so :meth:`QueryDecomposer.decompose` never raises for a
+  well-formed query.
 """
 
 from __future__ import annotations
@@ -58,7 +85,7 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 from reporag.config import settings
 
@@ -475,34 +502,12 @@ class QueryClassifier:
     def _build_langchain_llm() -> LLMCallable:
         """Construct the langchain LLM client from settings.
 
-        The langchain ``invoke`` API returns a message object whose
-        ``content`` attribute holds the text; we wrap it in a plain
-        ``(prompt) -> str`` callable so the rest of the classifier is
-        provider-agnostic and testable with a simple fake.
+        Delegates to the module-level :func:`_build_langchain_llm`, which
+        is shared with :class:`QueryDecomposer` (see the "Decomposer"
+        section below) so there is exactly one place that knows how to
+        build a provider-agnostic ``(prompt) -> str`` callable.
         """
-        if settings.llm_provider == "anthropic":
-            from langchain_anthropic import ChatAnthropic
-
-            client = ChatAnthropic(
-                model=settings.anthropic_model,
-                api_key=settings.anthropic_api_key.get_secret_value(),
-                temperature=0.0,
-            )
-        else:
-            from langchain_openai import ChatOpenAI
-
-            client = ChatOpenAI(
-                model=settings.openai_model,
-                api_key=settings.openai_api_key.get_secret_value(),
-                temperature=0.0,
-            )
-
-        def _invoke(prompt: str) -> str:
-            response = client.invoke(prompt)
-            # langchain returns a message object with a ``content`` attr.
-            return str(getattr(response, "content", response))
-
-        return _invoke
+        return _build_langchain_llm()
 
     # ------------------------------------------------------------------
     # Properties
@@ -635,3 +640,1025 @@ def _is_unset_secret(secret: Any) -> bool:
         "sk-your-key-here",
         "sk-ant-your-key-here",
     }
+
+
+# ---------------------------------------------------------------------------
+# Shared LLM construction (used by both QueryClassifier and QueryDecomposer)
+# ---------------------------------------------------------------------------
+
+
+def _build_langchain_llm() -> LLMCallable:
+    """Construct a provider-agnostic ``(prompt: str) -> str`` langchain client.
+
+    Shared by :class:`QueryClassifier` and :class:`QueryDecomposer` so the
+    two LLM-backed components in this module stay in lockstep -- one place
+    to add a provider, one place to fix a bug.
+    """
+    if settings.llm_provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+
+        client = ChatAnthropic(
+            model=settings.anthropic_model,
+            api_key=settings.anthropic_api_key.get_secret_value(),
+            temperature=0.0,
+        )
+    else:
+        from langchain_openai import ChatOpenAI
+
+        client = ChatOpenAI(
+            model=settings.openai_model,
+            api_key=settings.openai_api_key.get_secret_value(),
+            temperature=0.0,
+        )
+
+    def _invoke(prompt: str) -> str:
+        response = client.invoke(prompt)
+        return str(getattr(response, "content", response))
+
+    return _invoke
+
+
+# ===========================================================================
+# Query decomposer (Issue 21)
+# ===========================================================================
+#
+# See the module docstring for the full LangGraph state-machine diagram.
+# Layout mirrors the classifier above: public types, few-shot prompt, pure
+# rule-based fallback, pure LLM-response parser, then the stateful
+# orchestrator class -- each layer independently unit-testable.
+
+# ---------------------------------------------------------------------------
+# Public types
+# ---------------------------------------------------------------------------
+
+ExpectedAnswerType = Literal["code", "explanation", "list"]
+"""What kind of result a sub-query is expected to surface."""
+
+_VALID_ANSWER_TYPES: frozenset[str] = frozenset({"code", "explanation", "list"})
+
+# Tolerant synonym map so a slightly-off LLM label (e.g. "snippet",
+# "summary") still lands on a valid category instead of failing validation
+# outright -- the same "be tolerant of LLM phrasing" philosophy as
+# :func:`parse_llm_response`. Anything unrecognized defaults to
+# "explanation" (the safest label: it never implies a structural guarantee
+# like "code" or "list" that downstream rendering might rely on).
+_ANSWER_TYPE_SYNONYMS: dict[str, ExpectedAnswerType] = {
+    "code": "code",
+    "snippet": "code",
+    "code_snippet": "code",
+    "location": "code",
+    "definition": "code",
+    "explanation": "explanation",
+    "description": "explanation",
+    "summary": "explanation",
+    "narrative": "explanation",
+    "list": "list",
+    "items": "list",
+    "enumeration": "list",
+}
+
+
+def _coerce_answer_type(raw_type: Any) -> ExpectedAnswerType:
+    """Map a raw LLM-provided label onto one of the three valid categories."""
+    key = str(raw_type).strip().lower()
+    return _ANSWER_TYPE_SYNONYMS.get(key, "explanation")
+
+
+@dataclass(frozen=True)
+class DecompositionStep:
+    """A single ordered sub-query within a :class:`DecompositionPlan`.
+
+    Attributes:
+        id: A short, unique identifier within the plan (e.g. ``"step-1"``).
+        query: The sub-query text to execute.
+        expected_answer_type: What kind of result this sub-query should
+            surface -- one of ``code``, ``explanation``, or ``list``.
+        depends_on: Ids of *earlier* steps in the same plan whose results
+            this sub-query needs as context. Empty for steps that can run
+            immediately. These are the dependency edges from the issue's
+            acceptance criteria.
+
+    ``text`` and ``context_from`` are read-only aliases for ``query`` and
+    ``depends_on`` respectively, matching the field names used in the issue
+    description (``text``, ``expected_answer_type``, ``context_from``) so
+    callers can use either vocabulary.
+    """
+
+    id: str
+    query: str
+    expected_answer_type: ExpectedAnswerType
+    depends_on: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # Dataclasses do not enforce Literal types at runtime, and this
+        # class can be constructed directly (not just via the parser
+        # above, which already coerces), so validate defensively here too.
+        if not self.id or not self.id.strip():
+            raise ValueError("DecompositionStep.id must be a non-empty string.")
+        if not self.query or not self.query.strip():
+            raise ValueError("DecompositionStep.query must be a non-empty string.")
+        if self.expected_answer_type not in _VALID_ANSWER_TYPES:
+            raise ValueError(
+                f"expected_answer_type must be one of {sorted(_VALID_ANSWER_TYPES)}, "
+                f"got {self.expected_answer_type!r}."
+            )
+
+    @property
+    def text(self) -> str:
+        return self.query
+
+    @property
+    def context_from(self) -> tuple[str, ...]:
+        return self.depends_on
+
+
+@dataclass(frozen=True)
+class DecompositionPlan:
+    """The outcome of decomposing a single query.
+
+    Attributes:
+        original_query: The query that was decomposed.
+        steps: The ordered sub-queries. Always at least one step -- a query
+            that does not need decomposition still gets a single-step,
+            passthrough plan so callers can always iterate ``plan.steps``
+            uniformly.
+        needs_decomposition: ``False`` for the single-step passthrough case
+            (``simple-lookup`` / ``exploratory`` queries), ``True`` when the
+            query actually went through multi-step decomposition.
+        classification: The :class:`ClassificationResult` from the Issue 20
+            classifier that decided whether decomposition was needed.
+        source: ``"llm"`` when the LLM produced the plan, ``"rules"`` when
+            the deterministic fallback was used, ``"passthrough"`` when no
+            decomposition was needed at all.
+        raw_response: The raw LLM response text for the attempt that
+            ultimately produced the plan (``""`` for ``rules`` /
+            ``passthrough``).
+        fell_back: ``True`` when the rule-based fallback fired (LLM
+            disabled, unavailable, or its output failed validation after
+            retries).
+        metadata: Free-form extras -- the normalized repo context and the
+            number of LLM attempts made.
+    """
+
+    original_query: str
+    steps: tuple[DecompositionStep, ...]
+    needs_decomposition: bool
+    classification: ClassificationResult
+    source: Literal["llm", "rules", "passthrough"]
+    raw_response: str = ""
+    fell_back: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Repo context normalization
+# ---------------------------------------------------------------------------
+
+
+def _normalize_repo_context(
+    repo_context: dict[str, Any] | None,
+) -> dict[str, list[str]]:
+    """Normalize the caller-supplied repo context to ``{"modules": [...], "symbols": [...]}``.
+
+    Accepts ``modules`` and either ``symbols`` or ``key_symbols`` (both
+    appear across the issue text and README) so callers do not need to
+    remember the exact key name. Missing or malformed input degrades to
+    empty lists rather than raising -- repo context is an optional
+    grounding aid, not a required input.
+    """
+    if not repo_context:
+        return {"modules": [], "symbols": []}
+    modules = repo_context.get("modules") or []
+    symbols = repo_context.get("symbols") or repo_context.get("key_symbols") or []
+    return {
+        "modules": [str(m) for m in modules],
+        "symbols": [str(s) for s in symbols],
+    }
+
+
+def _matching_context_items(text: str, repo_context: dict[str, list[str]]) -> list[str]:
+    """Return module/symbol names from *repo_context* that appear (case-insensitively) in *text*.
+
+    Checks both ``modules`` and ``symbols`` -- a query mentioning a known
+    symbol (e.g. ``authenticate_user``) is just as groundable as one
+    mentioning a known module (e.g. ``auth``), so both are considered.
+    Order is preserved and duplicates are dropped.
+    """
+    lowered = text.lower()
+    candidates = list(repo_context.get("modules", [])) + list(
+        repo_context.get("symbols", [])
+    )
+    matches: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate and candidate.lower() in lowered and candidate not in seen:
+            matches.append(candidate)
+            seen.add(candidate)
+    return matches
+
+
+def _grounding_note(text: str, repo_context: dict[str, list[str]]) -> str:
+    """Build a short ``" (relevant context: ...)"`` suffix when *text* mentions a known module or symbol."""
+    matches = _matching_context_items(text, repo_context)
+    if not matches:
+        return ""
+    return f" (relevant context: {', '.join(matches)})"
+
+
+# ---------------------------------------------------------------------------
+# Few-shot prompt
+# ---------------------------------------------------------------------------
+
+# Four worked examples spanning the shapes of multi-hop query this
+# decomposer needs to handle well: an explicit "from A to B" flow, a named
+# subsystem flow grounded in repo context, a caller/callee trace, and a
+# "trace the path" phrasing. Each shows repo context actually changing the
+# sub-query wording (Issue 21's "uses repo context for informed
+# decomposition" criterion), not just being echoed back.
+_DECOMPOSITION_FEW_SHOT: tuple[tuple[str, str, str], ...] = (
+    (
+        "How does a request go from the API endpoint to the database?",
+        '{"modules": ["api", "routes", "db", "models"]}',
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "id": "step-1",
+                        "query": "Locate the API route handler that receives the incoming request",
+                        "expected_answer_type": "code",
+                        "depends_on": [],
+                    },
+                    {
+                        "id": "step-2",
+                        "query": "Locate the database access layer in the models/db module",
+                        "expected_answer_type": "code",
+                        "depends_on": [],
+                    },
+                    {
+                        "id": "step-3",
+                        "query": "Trace how the route handler passes data through to the database layer",
+                        "expected_answer_type": "explanation",
+                        "depends_on": ["step-1", "step-2"],
+                    },
+                ]
+            }
+        ),
+    ),
+    (
+        "How does the auth flow work end-to-end?",
+        '{"modules": ["auth", "middleware", "session"]}',
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "id": "step-1",
+                        "query": "Locate the auth entry point (login route or auth middleware)",
+                        "expected_answer_type": "code",
+                        "depends_on": [],
+                    },
+                    {
+                        "id": "step-2",
+                        "query": "Locate how the session module validates credentials and issues a session",
+                        "expected_answer_type": "code",
+                        "depends_on": ["step-1"],
+                    },
+                    {
+                        "id": "step-3",
+                        "query": "Explain how the auth entry point connects to session creation end-to-end",
+                        "expected_answer_type": "explanation",
+                        "depends_on": ["step-1", "step-2"],
+                    },
+                ]
+            }
+        ),
+    ),
+    (
+        "What calls the authenticate_user function and what does it call next?",
+        "{}",
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "id": "step-1",
+                        "query": "Find all callers of authenticate_user",
+                        "expected_answer_type": "list",
+                        "depends_on": [],
+                    },
+                    {
+                        "id": "step-2",
+                        "query": "Find what authenticate_user calls internally",
+                        "expected_answer_type": "list",
+                        "depends_on": [],
+                    },
+                    {
+                        "id": "step-3",
+                        "query": "Explain the call chain from the callers, through authenticate_user, to its callees",
+                        "expected_answer_type": "explanation",
+                        "depends_on": ["step-1", "step-2"],
+                    },
+                ]
+            }
+        ),
+    ),
+    (
+        "Trace the path from the login route to the session token creation.",
+        '{"modules": ["routes", "auth", "tokens"]}',
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "id": "step-1",
+                        "query": "Locate the login route in the routes module",
+                        "expected_answer_type": "code",
+                        "depends_on": [],
+                    },
+                    {
+                        "id": "step-2",
+                        "query": "Locate the token creation logic in the tokens module",
+                        "expected_answer_type": "code",
+                        "depends_on": [],
+                    },
+                    {
+                        "id": "step-3",
+                        "query": "Trace the path from the login route, through auth, to token creation",
+                        "expected_answer_type": "explanation",
+                        "depends_on": ["step-1", "step-2"],
+                    },
+                ]
+            }
+        ),
+    ),
+)
+
+
+def _build_decomposition_prompt(query: str, repo_context: dict[str, list[str]]) -> str:
+    """Build the few-shot decomposition prompt for *query* and *repo_context*."""
+    examples_block = "\n\n".join(
+        f"Query: {example_query}\nRepo context: {example_ctx}\nOutput: {example_out}"
+        for example_query, example_ctx, example_out in _DECOMPOSITION_FEW_SHOT
+    )
+    context_str = json.dumps(repo_context)
+    return (
+        "You are a query decomposer for a code intelligence system. Break "
+        "the user's multi-hop query into 2 to 5 ordered sub-queries that, "
+        "executed in order, retrieve everything needed to answer it.\n"
+        "\n"
+        "Rules:\n"
+        "- Return between 2 and 5 sub-queries.\n"
+        '- Each sub-query needs: id (e.g. "step-1"), query (the '
+        'sub-query text), expected_answer_type (one of "code", '
+        '"explanation", "list"), and depends_on (a list of ids of '
+        "EARLIER sub-queries whose results this one needs as context; "
+        "[] if none).\n"
+        "- depends_on may only reference ids that appear earlier in the "
+        "list -- no forward references, no cycles.\n"
+        "- Use the repo context (module names / key symbols) below to make "
+        "sub-queries concrete and grounded in this repo, not generic.\n"
+        "- If the query does not actually need multiple retrieval steps, "
+        "still return at least 2 steps by splitting it into a lookup step "
+        "and an explanation step.\n"
+        "\n"
+        "Examples:\n"
+        f"{examples_block}\n"
+        "\n"
+        "Now decompose this query:\n"
+        f"Query: {query}\n"
+        f"Repo context: {context_str}\n"
+        "\n"
+        "Respond with ONLY a JSON object on a single line in this exact "
+        "format (no markdown, no explanation):\n"
+        '{"steps": [{"id": "step-1", "query": "...", '
+        '"expected_answer_type": "code|explanation|list", '
+        '"depends_on": []}, ...]}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Rule-based decomposer (pure, network-free, unit-testable)
+# ---------------------------------------------------------------------------
+
+# Matches an explicit "from A to B [to C ...]" flow description and
+# captures everything after "from " up to the end of the query. The chain
+# is split into individual endpoints by ``_TO_SPLIT_RE`` below, so a query
+# naming 2, 3, or 4 endpoints (e.g. "from source to destination to sink")
+# gets one locate step per endpoint rather than only the first and last.
+_FROM_RE = re.compile(r"\bfrom\s+(?:the\s+)?(.+)$", re.IGNORECASE)
+
+# Splits the captured "from ..." remainder on each "to" -- this is what
+# turns a 3+ hop chain into separate endpoints instead of one blob.
+_TO_SPLIT_RE = re.compile(r"\s+to\s+(?:the\s+)?", re.IGNORECASE)
+
+# Boilerplate stripped from a query to leave just the "subject" -- used to
+# phrase generic fallback sub-queries naturally (e.g. "How does the auth
+# flow work end-to-end?" -> "the auth flow").
+_BOILERPLATE_RE = re.compile(
+    r"^(how\s+does|how\s+do|explain|trace|describe|walk\s+me\s+through)\s+"
+    r"|\s+(works?(\s+end-to-end)?|end-to-end|step\s+by\s+step)\s*[\?\.]*$",
+    re.IGNORECASE,
+)
+
+
+def _extract_subject(query: str) -> str:
+    """Strip boilerplate phrasing from *query*, leaving the core subject."""
+    subject = query.strip().rstrip("?.")
+    subject = _BOILERPLATE_RE.sub("", subject).strip()
+    return subject or query.strip()
+
+
+def _split_from_to_chain(query: str) -> list[str] | None:
+    """Split a ``"from A to B [to C ...]"`` query into its ordered endpoints.
+
+    Handles chains of any length, not just a single "A to B" pair: "from
+    source to destination to sink" splits into three endpoints
+    (``["source", "destination", "sink"]``), each of which gets its own
+    locate step in :func:`rule_based_decompose` rather than the extra hop
+    being folded into one endpoint's label.
+
+    Args:
+        query: The natural-language query to inspect.
+
+    Returns:
+        The ordered list of endpoint strings if the query contains a
+        ``"from ... to ..."`` chain with at least two endpoints, otherwise
+        ``None`` (no "from", or "from" with no "to" at all).
+    """
+    match = _FROM_RE.search(query)
+    if match is None:
+        return None
+    remainder = match.group(1).rstrip("?.")
+    endpoints = [
+        segment.strip().rstrip("?.") for segment in _TO_SPLIT_RE.split(remainder)
+    ]
+    endpoints = [endpoint for endpoint in endpoints if endpoint]
+    if len(endpoints) < 2:
+        return None
+    return endpoints
+
+
+def rule_based_decompose(
+    query: str, repo_context: dict[str, list[str]] | None = None
+) -> list[DecompositionStep]:
+    """Deterministically decompose *query* without an LLM.
+
+    This is the network-free fallback, used when the LLM is disabled, no
+    API key is configured, or an LLM-produced plan fails validation after
+    retries. It always returns a valid plan (never fails validation
+    itself), so :meth:`QueryDecomposer.decompose` never raises for a
+    well-formed, non-empty query.
+
+    Two shapes are handled:
+
+    * An explicit ``"... from A to B [to C ...] ..."`` flow -- one "locate"
+      step per endpoint (2 to 4 of them), plus one "trace" step depending
+      on all of them. A 2-endpoint chain mirrors the issue's own example
+      query almost exactly; a longer chain (e.g. "from source to
+      destination to sink") gets a locate step *per hop* rather than
+      folding everything past the first "to" into one endpoint label. A
+      chain of more than 4 endpoints would need more than 5 steps total,
+      so it falls through to the generic shape below instead.
+    * Everything else -- a generic "identify entry point", "retrieve
+      implementation", "explain end-to-end" template built around the
+      query's core subject.
+
+    When *repo_context* module or symbol names appear in the sub-query
+    text, a ``" (relevant context: ...)"`` note is appended so the
+    rule-based path also honors "uses repo context for informed
+    decomposition", not just the LLM path.
+
+    Args:
+        query: The natural-language query to decompose.
+        repo_context: Normalized repo context (see
+            :func:`_normalize_repo_context`); ``None`` is treated as empty.
+
+    Returns:
+        A list of :class:`DecompositionStep` objects (3 for the generic
+        shape, or ``len(endpoints) + 1`` for a from/to chain) with valid,
+        backward-only dependency edges.
+    """
+    repo_context = repo_context or {"modules": [], "symbols": []}
+
+    endpoints = _split_from_to_chain(query)
+    if endpoints is not None and 2 <= len(endpoints) <= 4:
+        locate_steps = [
+            DecompositionStep(
+                id=f"step-{index + 1}",
+                query=f"Locate {endpoint}{_grounding_note(endpoint, repo_context)}",
+                expected_answer_type="code",
+                depends_on=(),
+            )
+            for index, endpoint in enumerate(endpoints)
+        ]
+        if len(endpoints) == 2:
+            trace_query = f"Trace how {endpoints[0]} connects to {endpoints[1]}"
+        else:
+            middle = ", ".join(endpoints[1:-1])
+            trace_query = (
+                f"Trace the path from {endpoints[0]}, through {middle}, "
+                f"to {endpoints[-1]}"
+            )
+        trace_step = DecompositionStep(
+            id=f"step-{len(endpoints) + 1}",
+            query=trace_query,
+            expected_answer_type="explanation",
+            depends_on=tuple(step.id for step in locate_steps),
+        )
+        return [*locate_steps, trace_step]
+
+    # No from/to chain (or one too long to fit in 5 steps) -- fall back to
+    # the generic three-step template built around the query's subject.
+    subject = _extract_subject(query)
+    return [
+        DecompositionStep(
+            id="step-1",
+            query=f"Identify the entry point and key symbols for {subject}",
+            expected_answer_type="code",
+            depends_on=(),
+        ),
+        DecompositionStep(
+            id="step-2",
+            query=(
+                f"Retrieve the implementation details for {subject}"
+                f"{_grounding_note(subject, repo_context)}"
+            ),
+            expected_answer_type="code",
+            depends_on=("step-1",),
+        ),
+        DecompositionStep(
+            id="step-3",
+            query=f"Explain how {subject} flows end-to-end",
+            expected_answer_type="explanation",
+            depends_on=("step-1", "step-2"),
+        ),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# LLM response parsing (pure, unit-testable)
+# ---------------------------------------------------------------------------
+
+
+def _extract_json_object(raw: str) -> str | None:
+    """Extract the first balanced ``{...}`` block from *raw*.
+
+    Unlike the classifier's single-level regex (``{[^{}]*}``), a
+    decomposition response contains a nested ``steps`` array, so this walks
+    brace depth to find the *matching* closing brace -- tolerant of
+    surrounding markdown fences or prose, same as the classifier's parser.
+    """
+    start = raw.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for index in range(start, len(raw)):
+        char = raw[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return raw[start : index + 1]
+    return None
+
+
+def parse_decomposition_response(
+    raw: str,
+) -> tuple[list[DecompositionStep], str | None]:
+    """Parse the raw LLM response text into a list of :class:`DecompositionStep`.
+
+    The LLM is prompted to return strict JSON: ``{"steps": [...]}``. This
+    parser is tolerant of markdown fences / leading prose (via
+    :func:`_extract_json_object`) and of a slightly-off
+    ``expected_answer_type`` label (via :func:`_coerce_answer_type`), but
+    is strict about structure: a missing ``query``, a non-list
+    ``depends_on``, or a non-object step is a parse error, since those
+    cannot be safely guessed.
+
+    Args:
+        raw: The raw text returned by the LLM.
+
+    Returns:
+        A ``(steps, error)`` tuple. On success ``error`` is ``None`` and
+        ``steps`` is non-empty (though not yet checked for count /
+        dependency validity -- see :func:`validate_steps` for that). On
+        failure ``steps`` is ``[]`` and ``error`` describes what went
+        wrong, for logging and for the retry/fallback decision.
+    """
+    if not raw or not raw.strip():
+        return [], "empty response"
+
+    json_text = _extract_json_object(raw)
+    if json_text is None:
+        return [], "no JSON object found"
+
+    try:
+        payload = json.loads(json_text)
+    except json.JSONDecodeError as exc:
+        return [], f"invalid JSON: {exc}"
+
+    raw_steps = payload.get("steps") if isinstance(payload, dict) else None
+    if not isinstance(raw_steps, list) or not raw_steps:
+        return [], "missing or empty 'steps' list"
+
+    steps: list[DecompositionStep] = []
+    for index, raw_step in enumerate(raw_steps):
+        if not isinstance(raw_step, dict):
+            return [], f"step {index} is not an object"
+
+        step_id = str(raw_step.get("id", "")).strip() or f"step-{index + 1}"
+
+        step_query = str(raw_step.get("query", raw_step.get("text", ""))).strip()
+        if not step_query:
+            return [], f"step {index} ({step_id!r}) is missing 'query' text"
+
+        answer_type = _coerce_answer_type(
+            raw_step.get("expected_answer_type", "explanation")
+        )
+
+        deps_raw = raw_step.get("depends_on", raw_step.get("context_from", []))
+        if not isinstance(deps_raw, list):
+            return [], f"step {index} ({step_id!r}) has a non-list 'depends_on'"
+        depends_on = tuple(str(dep).strip() for dep in deps_raw)
+
+        steps.append(
+            DecompositionStep(
+                id=step_id,
+                query=step_query,
+                expected_answer_type=answer_type,
+                depends_on=depends_on,
+            )
+        )
+
+    return steps, None
+
+
+def validate_steps(steps: list[DecompositionStep]) -> str | None:
+    """Structurally validate a parsed decomposition plan.
+
+    Checks (in order, returning the first failure):
+
+    1. Non-empty.
+    2. Between 2 and 5 steps (Issue 21's acceptance criterion).
+    3. Every step id is non-empty and unique.
+    4. Every ``depends_on`` entry references a step id that appears
+       *strictly earlier* in the list. Walking ids into a ``seen`` set in
+       list order and checking membership before insertion enforces both
+       "no forward references" and "no cycles" in one pass -- a step can
+       never depend on itself or on anything after it.
+
+    ``expected_answer_type`` is not re-checked here: ``DecompositionStep``
+    validates it (against ``code`` / ``explanation`` / ``list``) in its own
+    ``__post_init__``, so by the time a step exists in *steps* it is
+    already guaranteed valid.
+
+    Args:
+        steps: The parsed steps to validate.
+
+    Returns:
+        ``None`` if *steps* is a structurally valid plan, otherwise a
+        human-readable error string describing the first problem found.
+    """
+    if not steps:
+        return "no steps"
+    if not 2 <= len(steps) <= 5:
+        return f"expected 2-5 steps, got {len(steps)}"
+
+    seen_ids: set[str] = set()
+    for step in steps:
+        if not step.id:
+            return "a step has an empty id"
+        if step.id in seen_ids:
+            return f"duplicate step id: {step.id!r}"
+        for dep in step.depends_on:
+            if dep not in seen_ids:
+                return (
+                    f"step {step.id!r} has depends_on {dep!r}, which is not "
+                    "an earlier step id (forward reference or cycle)"
+                )
+        seen_ids.add(step.id)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# QueryDecomposer
+# ---------------------------------------------------------------------------
+
+
+class _DecomposerState(TypedDict, total=False):
+    """LangGraph state threaded through the decomposition state machine."""
+
+    query: str
+    repo_context: dict[str, list[str]]
+    classification: ClassificationResult
+    attempt: int
+    steps: list[DecompositionStep]
+    source: Literal["llm", "rules", "passthrough"]
+    raw_response: str
+    fell_back: bool
+    error: str | None
+
+
+class QueryDecomposer:
+    """Breaks a multi-hop query into ordered sub-queries with dependency edges.
+
+    Orchestrated by a LangGraph state machine (see the module docstring for
+    the diagram):
+
+    1. ``classify`` -- reuse the Issue 20 :class:`QueryClassifier` to decide
+       whether the query needs decomposition at all.
+    2. ``simple-lookup`` / ``exploratory`` -> ``passthrough``: wrap the
+       original query in a single-step plan. ``multi-hop`` -> ``decompose``.
+    3. ``decompose`` -- prompt the LLM (few-shot, repo-context-grounded) and
+       parse its response into candidate steps.
+    4. ``validate`` -- structurally check the candidate plan
+       (:func:`validate_steps`). Valid -> done. Invalid due to a parse
+       error or failed LLM call -> retry ``decompose`` up to
+       ``max_retries`` times. Invalid because the LLM is disabled/
+       unavailable, or retries are exhausted -> ``rule_fallback``.
+    5. ``rule_fallback`` -- deterministic, network-free decomposition
+       (:func:`rule_based_decompose`), which always produces a valid plan.
+
+    This means :meth:`decompose` never raises for a well-formed, non-empty
+    query, regardless of whether an LLM is configured, reachable, or
+    well-behaved.
+
+    Args:
+        llm: A pre-built callable ``(prompt: str) -> str`` -- the same test
+            seam as :class:`QueryClassifier`, making tests network-free.
+            When ``None`` (default) a real langchain LLM is constructed
+            lazily on the first LLM-path call.
+        classifier: A pre-built :class:`QueryClassifier` to reuse (e.g. to
+            share one instance's LLM connection across callers, or to
+            inject a fake in tests). When ``None`` a new one is constructed
+            with ``use_llm=use_llm``.
+        use_llm: When ``True`` (default) the LLM decomposition path is
+            used; when ``False`` only the rule-based decomposer ever runs
+            (no LLM is loaded, and the classifier is also constructed with
+            ``use_llm=False`` unless a *classifier* was explicitly passed
+            in). Defaults to ``settings.query_classifier_use_llm``.
+        max_retries: Additional LLM attempts after a parse/validation
+            failure before falling back to rules. A configuration or
+            availability error (LLM disabled, no API key) skips straight to
+            the fallback instead of spending retries on a call that cannot
+            succeed. Defaults to ``1`` (two attempts total). Must be
+            ``>= 0``.
+
+    Raises:
+        ValueError: If *max_retries* is negative.
+    """
+
+    def __init__(
+        self,
+        llm: LLMCallable | None = None,
+        *,
+        classifier: QueryClassifier | None = None,
+        use_llm: bool | None = None,
+        max_retries: int = 1,
+    ) -> None:
+        if max_retries < 0:
+            raise ValueError(f"max_retries must be >= 0, got {max_retries!r}.")
+
+        self._resolved_llm: LLMCallable | None = llm
+        self._loaded = False
+        self.use_llm = (
+            use_llm if use_llm is not None else settings.query_classifier_use_llm
+        )
+        self.classifier = classifier or QueryClassifier(use_llm=self.use_llm)
+        self.max_retries = max_retries
+        self._graph = self._build_graph()
+
+    # ------------------------------------------------------------------
+    # Lazy LLM loading (mirrors QueryClassifier._ensure_loaded)
+    # ------------------------------------------------------------------
+
+    def _ensure_loaded(self) -> LLMCallable | None:
+        """Resolve the LLM callable, constructing a real client if needed.
+
+        Returns ``None`` (and logs a warning) when no API key is
+        configured for the active provider, so the caller can route
+        straight to the rule-based fallback.
+        """
+        if self._loaded:
+            return self._resolved_llm
+
+        if self._resolved_llm is None:
+            api_key = settings.active_llm_api_key
+            if _is_unset_secret(api_key):
+                logger.warning(
+                    "QueryDecomposer: LLM is enabled but no API key is "
+                    "configured for provider '%s'; falling back to "
+                    "rule-based decomposition.",
+                    settings.llm_provider,
+                )
+                self._loaded = True
+                return None
+            self._resolved_llm = _build_langchain_llm()
+
+        self._loaded = True
+        return self._resolved_llm
+
+    # ------------------------------------------------------------------
+    # LangGraph nodes
+    # ------------------------------------------------------------------
+
+    def _node_classify(self, state: _DecomposerState) -> dict[str, Any]:
+        return {"classification": self.classifier.classify(state["query"])}
+
+    def _node_passthrough(self, state: _DecomposerState) -> dict[str, Any]:
+        classification = state["classification"]
+        # Exploratory queries want a broad summary; simple-lookup queries
+        # want a direct symbol/location result.
+        answer_type: ExpectedAnswerType = (
+            "explanation" if classification.query_type == "exploratory" else "code"
+        )
+        step = DecompositionStep(
+            id="step-1",
+            query=state["query"],
+            expected_answer_type=answer_type,
+            depends_on=(),
+        )
+        return {
+            "steps": [step],
+            "source": "passthrough",
+            "raw_response": "",
+            "fell_back": False,
+            "error": None,
+        }
+
+    def _node_decompose_llm(self, state: _DecomposerState) -> dict[str, Any]:
+        attempt = state.get("attempt", 0) + 1
+
+        if not self.use_llm:
+            return {
+                "steps": [],
+                "source": "llm",
+                "error": "llm_disabled",
+                "attempt": attempt,
+            }
+
+        llm = self._ensure_loaded()
+        if llm is None:
+            return {
+                "steps": [],
+                "source": "llm",
+                "error": "llm_unavailable",
+                "attempt": attempt,
+            }
+
+        prompt = _build_decomposition_prompt(state["query"], state["repo_context"])
+        try:
+            raw_response = llm(prompt)
+        except Exception as exc:  # noqa: BLE001 - any LLM client failure
+            logger.warning(
+                "QueryDecomposer: LLM call failed (%s); will retry or fall "
+                "back to rule-based decomposition.",
+                exc,
+            )
+            return {
+                "steps": [],
+                "source": "llm",
+                "raw_response": "",
+                "error": f"llm_call_failed: {exc}",
+                "attempt": attempt,
+            }
+
+        steps, parse_error = parse_decomposition_response(raw_response)
+        return {
+            "steps": steps,
+            "source": "llm",
+            "raw_response": raw_response,
+            "error": parse_error,
+            "attempt": attempt,
+        }
+
+    def _node_validate(self, state: _DecomposerState) -> dict[str, Any]:
+        if state.get("error"):
+            # Already failed upstream (LLM disabled/unavailable/call
+            # failed) -- nothing to structurally validate.
+            return {}
+        error = validate_steps(state.get("steps", []))
+        if error:
+            logger.info("QueryDecomposer: LLM plan failed validation (%s).", error)
+        return {"error": error}
+
+    def _node_rule_fallback(self, state: _DecomposerState) -> dict[str, Any]:
+        steps = rule_based_decompose(state["query"], state["repo_context"])
+        return {"steps": steps, "source": "rules", "error": None, "fell_back": True}
+
+    # ------------------------------------------------------------------
+    # LangGraph routing
+    # ------------------------------------------------------------------
+
+    def _route_after_classify(self, state: _DecomposerState) -> str:
+        if state["classification"].query_type == "multi-hop":
+            return "decompose"
+        return "passthrough"
+
+    def _route_after_validate(self, state: _DecomposerState) -> str:
+        error = state.get("error")
+        if error is None:
+            return "done"
+        # Config/availability errors are deterministic -- retrying against
+        # the same unconfigured or unreachable-by-design LLM cannot
+        # succeed, so go straight to the fallback instead of burning the
+        # retry budget.
+        if error in ("llm_disabled", "llm_unavailable"):
+            return "fallback"
+        # A parse/validation error, or a call failure (which may well be
+        # transient -- a rate limit, a network blip), is worth one retry
+        # before giving up on the LLM path.
+        if state.get("attempt", 0) <= self.max_retries:
+            return "retry"
+        return "fallback"
+
+    def _build_graph(self):  # noqa: ANN201 - langgraph's compiled-graph type
+        """Build and compile the decomposition state machine.
+
+        Imported lazily so ``import reporag.agent.planner`` stays cheap and
+        does not require ``langgraph`` to be installed for callers that
+        only need :class:`QueryClassifier`.
+        """
+        from langgraph.graph import END, START, StateGraph
+
+        graph = StateGraph(_DecomposerState)
+        graph.add_node("classify", self._node_classify)
+        graph.add_node("passthrough", self._node_passthrough)
+        graph.add_node("decompose", self._node_decompose_llm)
+        graph.add_node("validate", self._node_validate)
+        graph.add_node("rule_fallback", self._node_rule_fallback)
+
+        graph.add_edge(START, "classify")
+        graph.add_conditional_edges(
+            "classify",
+            self._route_after_classify,
+            {"passthrough": "passthrough", "decompose": "decompose"},
+        )
+        graph.add_edge("passthrough", END)
+        graph.add_edge("decompose", "validate")
+        graph.add_conditional_edges(
+            "validate",
+            self._route_after_validate,
+            {"done": END, "retry": "decompose", "fallback": "rule_fallback"},
+        )
+        graph.add_edge("rule_fallback", END)
+
+        return graph.compile()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def decompose(
+        self, query: str, repo_context: dict[str, Any] | None = None
+    ) -> DecompositionPlan:
+        """Decompose *query* into an ordered :class:`DecompositionPlan`.
+
+        Args:
+            query: The natural-language query to decompose.
+            repo_context: Optional grounding context, e.g.
+                ``{"modules": ["api", "routes", "db"], "symbols": [...]}``.
+                ``key_symbols`` is also accepted as an alias for
+                ``symbols``. Used to make LLM (and, where possible,
+                rule-based) sub-queries concrete rather than generic.
+
+        Returns:
+            A :class:`DecompositionPlan`. ``plan.steps`` always has at
+            least one entry -- 1 for a passthrough plan, 2-5 for an actual
+            decomposition.
+
+        Raises:
+            ValueError: If *query* is empty or whitespace-only.
+        """
+        if not query or not query.strip():
+            raise ValueError("query must be a non-empty string.")
+
+        normalized_context = _normalize_repo_context(repo_context)
+        initial_state: _DecomposerState = {
+            "query": query,
+            "repo_context": normalized_context,
+            "attempt": 0,
+            "error": None,
+        }
+        final_state = self._graph.invoke(initial_state)
+
+        source = final_state.get("source", "rules")
+        steps = tuple(final_state.get("steps") or [])
+        return DecompositionPlan(
+            original_query=query,
+            steps=steps,
+            needs_decomposition=source != "passthrough",
+            classification=final_state["classification"],
+            source=source,
+            raw_response=final_state.get("raw_response", ""),
+            fell_back=bool(final_state.get("fell_back", False)),
+            metadata={
+                "repo_context": normalized_context,
+                "attempts": final_state.get("attempt", 0),
+            },
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"QueryDecomposer(use_llm={self.use_llm}, "
+            f"max_retries={self.max_retries}, loaded={self._loaded})"
+        )
