@@ -112,6 +112,22 @@ class Settings(BaseSettings):
     # rule-based fallback (useful in tests / offline / no-API-key scenarios).
     query_classifier_use_llm: bool = True
 
+    # --- Strategy router / sub-query executor (Issue 22) ---
+    # Below this confidence the router falls back to its rule-based
+    # classification (the safest default -- hybrid covers every strategy,
+    # so a low-confidence single-strategy decision never misses a path).
+    strategy_router_confidence_threshold: float = 0.7
+    # When True the router uses the LLM for routing; when False it uses only
+    # the rule-based fallback (tests / offline / no-API-key scenarios).
+    strategy_router_use_llm: bool = True
+    # Which component strategies constitute a "hybrid" route. The hybrid
+    # route runs every enabled component and fuses results with RRF.
+    strategy_router_hybrid_components: str = "vector,bm25"
+    # Per-sub-query retrieval defaults consumed by the executor.
+    strategy_router_default_top_k: int = 20
+    # Executor: retry a failed sub-query once before skipping it.
+    executor_retry_failed_steps: bool = True
+
     # --- Ingestion ---
     max_repo_size_mb: int = 500
     clone_depth: int = 1

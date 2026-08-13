@@ -87,7 +87,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypedDict
 
-from reporag.config import settings
+from reporag.config import _is_unset, settings
 
 logger = logging.getLogger(__name__)
 
@@ -483,7 +483,7 @@ class QueryClassifier:
 
         if self._resolved_llm is None:
             api_key = settings.active_llm_api_key
-            if _is_unset_secret(api_key):
+            if _is_unset(api_key):
                 logger.warning(
                     "QueryClassifier: LLM is enabled but no API key is "
                     "configured for provider '%s'; falling back to rule-based "
@@ -617,29 +617,6 @@ class QueryClassifier:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _is_unset_secret(secret: Any) -> bool:
-    """Return True if *secret* is an unset or placeholder SecretStr.
-
-    Mirrors :func:`reporag.config._is_unset` but is duplicated here to avoid
-    importing the private helper from config (which would couple this module
-    to config internals).  Accepts a :class:`pydantic.SecretStr` or a plain
-    string.
-    """
-    from pydantic import SecretStr
-
-    if isinstance(secret, SecretStr):
-        value = secret.get_secret_value().strip()
-    else:
-        value = str(secret).strip()
-    return value in {
-        "",
-        "change-me",
-        "change-me-to-a-random-string",
-        "sk-your-key-here",
-        "sk-ant-your-key-here",
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -1443,7 +1420,7 @@ class QueryDecomposer:
 
         if self._resolved_llm is None:
             api_key = settings.active_llm_api_key
-            if _is_unset_secret(api_key):
+            if _is_unset(api_key):
                 logger.warning(
                     "QueryDecomposer: LLM is enabled but no API key is "
                     "configured for provider '%s'; falling back to "
