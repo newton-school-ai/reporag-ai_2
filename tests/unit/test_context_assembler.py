@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.reporag.generation.context_assembler import (
+from reporag.generation.context_assembler import (
     ContextAssembler,
     _approximate_tokens,
     _Chunk,
@@ -13,7 +13,7 @@ from src.reporag.generation.context_assembler import (
     _merge_chunks,
     _overlap_fraction,
 )
-from src.reporag.retrieval.vector_search import RetrievalResult
+from reporag.retrieval.vector_search import RetrievalResult
 
 # ---------------------------------------------------------------------------
 # Helpers
