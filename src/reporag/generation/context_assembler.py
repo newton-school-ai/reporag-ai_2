@@ -6,6 +6,7 @@ and truncates to fit the context window.
 """
 
 import copy
+import os
 from collections import defaultdict
 
 from reporag.ingestion.chunker import count_tokens
@@ -22,6 +23,27 @@ class ContextAssembler:
             max_tokens: Maximum allowed tokens for the fully assembled context string.
         """
         self.max_tokens = max_tokens
+
+    @staticmethod
+    def _get_language_from_path(file_path: str) -> str:
+        """Get the markdown language identifier from the file extension."""
+        if not file_path:
+            return ""
+        ext = os.path.splitext(file_path)[1].lower()
+        if not ext:
+            return ""
+
+        mapping = {
+            ".py": "python",
+            ".ts": "typescript",
+            ".js": "javascript",
+            ".md": "markdown",
+            ".sh": "bash",
+            ".yml": "yaml",
+            ".yaml": "yaml",
+            ".txt": "text",
+        }
+        return mapping.get(ext, ext.lstrip("."))
 
     def assemble(self, results: list[RetrievalResult]) -> str:
         """Assemble retrieval results into a structured, token-limited string.
@@ -41,7 +63,13 @@ class ContextAssembler:
         sorted_results = sorted(results, key=lambda r: r.score, reverse=True)
 
         for result in sorted_results:
-            tokens = count_tokens(result.chunk_text)
+            # Estimate tokens of the final rendered string including markdown overhead
+            start = result.start_line if result.start_line is not None else "?"
+            end = result.end_line if result.end_line is not None else "?"
+            lang = self._get_language_from_path(result.file_path)
+            rendered_chunk = f"## {result.file_path} (lines {start}-{end})\n```{lang}\n{result.chunk_text.strip()}\n```\n\n"
+
+            tokens = count_tokens(rendered_chunk)
             if current_tokens + tokens > self.max_tokens:
                 continue
             selected.append(result)
@@ -73,9 +101,10 @@ class ContextAssembler:
             for mc in merged_chunks:
                 start = mc.start_line if mc.start_line is not None else "?"
                 end = mc.end_line if mc.end_line is not None else "?"
+                lang = self._get_language_from_path(file_path)
 
                 # Format: file header + line-numbered code block
-                part = f"## {file_path} (lines {start}-{end})\n```python\n{mc.chunk_text.strip()}\n```"
+                part = f"## {file_path} (lines {start}-{end})\n```{lang}\n{mc.chunk_text.strip()}\n```"
                 assembled_parts.append(part)
 
         return "\n\n".join(assembled_parts)

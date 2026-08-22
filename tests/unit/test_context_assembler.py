@@ -110,25 +110,23 @@ def test_merge_engulfed_chunk():
 
 
 def test_truncation_prioritizes_scores():
-    # Set max tokens very low, so only a few chunks fit
-    assembler = ContextAssembler(
-        max_tokens=10
-    )  # ~10 tokens fits only 1 or 2 small chunks
+    # Set max tokens so that only 2 chunks can fit (including markdown overhead)
+    assembler = ContextAssembler(max_tokens=50)  # ~25 tokens per rendered chunk
 
-    # Create chunks. count_tokens will be called.
-    # text lengths roughly correspond to token count (about 2-3 tokens each here)
+    # Create chunks. count_tokens will be called on the fully rendered markdown block.
     c1 = make_result(0.9, "src/a.py", 10, 10, "high_score_chunk")
+    # Make c2 very long so it definitely blows the budget
     c2 = make_result(
         0.2,
         "src/a.py",
         20,
         20,
-        "low_score_chunk_that_should_be_skipped_completely_because_it_does_not_fit_in_budget",
+        "low_score_chunk_that_should_be_skipped_completely_because_it_does_not_fit_in_budget_and_is_very_very_long"
+        * 10,
     )
     c3 = make_result(0.8, "src/a.py", 30, 30, "med_score_chunk")
 
     # We will pass c1, c2, c3. We expect c1 and c3 to be included, c2 to be dropped due to token limit
-    # Actually, if we just make c2 huge, it will be skipped.
     result = assembler.assemble([c1, c2, c3])
 
     assert "high_score_chunk" in result
@@ -147,12 +145,12 @@ def test_none_line_numbers():
     # None should sort first
     expected = (
         "## docs/readme.md (lines ?-?)\n"
-        "```python\n"
+        "```markdown\n"
         "# Title\n"
         "Doc content\n"
         "```\n\n"
         "## docs/readme.md (lines 10-15)\n"
-        "```python\n"
+        "```markdown\n"
         "Some specific lines\n"
         "```"
     )
