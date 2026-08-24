@@ -5,6 +5,8 @@ block for the LLM prompt. Orders chunks by file and line, merges overlaps,
 and truncates to fit the context window.
 """
 
+from __future__ import annotations
+
 import copy
 import os
 from collections import defaultdict
@@ -22,6 +24,8 @@ class ContextAssembler:
         Args:
             max_tokens: Maximum allowed tokens for the fully assembled context string.
         """
+        if max_tokens < 1:
+            raise ValueError(f"max_tokens must be >= 1, got {max_tokens!r}")
         self.max_tokens = max_tokens
 
     @staticmethod
@@ -36,11 +40,33 @@ class ContextAssembler:
         mapping = {
             ".py": "python",
             ".ts": "typescript",
+            ".tsx": "typescript",
             ".js": "javascript",
+            ".jsx": "javascript",
+            ".go": "go",
+            ".rs": "rust",
+            ".java": "java",
+            ".c": "c",
+            ".cpp": "cpp",
+            ".cc": "cpp",
+            ".h": "c",
+            ".hpp": "cpp",
+            ".cs": "csharp",
+            ".rb": "ruby",
+            ".php": "php",
             ".md": "markdown",
             ".sh": "bash",
+            ".bash": "bash",
+            ".zsh": "bash",
             ".yml": "yaml",
             ".yaml": "yaml",
+            ".json": "json",
+            ".toml": "toml",
+            ".sql": "sql",
+            ".html": "html",
+            ".css": "css",
+            ".xml": "xml",
+            ".dockerfile": "dockerfile",
             ".txt": "text",
         }
         return mapping.get(ext, ext.lstrip("."))
@@ -49,12 +75,16 @@ class ContextAssembler:
         """Assemble retrieval results into a structured, token-limited string.
 
         Algorithm:
-        1. Selects the highest-scored chunks that fit within `max_tokens`.
+        1. Selects highest-scored chunks that fit within `max_tokens`.
         2. Groups selected chunks by file path.
         3. Sorts chunks in each file by line number.
-        4. Merges chunks with >50% overlap to eliminate duplicate code.
+        4. Merges chunks with >50% overlap or full containment.
         5. Formats the chunks into line-numbered markdown code blocks.
+        6. Enforces post-merge token budget limit defensively.
         """
+        if not results:
+            return ""
+
         # 1. Select chunks by score within token budget
         selected: list[RetrievalResult] = []
         current_tokens = 0
@@ -85,6 +115,8 @@ class ContextAssembler:
 
         # 3. Sort, merge, and format for each file
         assembled_parts: list[str] = []
+        total_assembled_tokens = 0
+
         for file_path, chunks in sorted(grouped.items()):
             # Sort by start_line ascending, then end_line descending. Treat None as -1.
             sorted_chunks = sorted(
@@ -97,15 +129,20 @@ class ContextAssembler:
 
             merged_chunks = self._merge_overlapping(sorted_chunks)
 
-            # 4. Format each merged chunk
+            # 4. Format each merged chunk and enforce post-merge budget check
             for mc in merged_chunks:
                 start = mc.start_line if mc.start_line is not None else "?"
                 end = mc.end_line if mc.end_line is not None else "?"
                 lang = self._get_language_from_path(file_path)
 
-                # Format: file header + line-numbered code block
                 part = f"## {file_path} (lines {start}-{end})\n```{lang}\n{mc.chunk_text.strip()}\n```"
+                part_tokens = count_tokens(part + "\n\n")
+
+                if total_assembled_tokens + part_tokens > self.max_tokens:
+                    break
+
                 assembled_parts.append(part)
+                total_assembled_tokens += part_tokens
 
         return "\n\n".join(assembled_parts)
 
@@ -139,16 +176,20 @@ class ContextAssembler:
                 overlap = prev.end_line - current.start_line + 1
                 len_prev = prev.end_line - prev.start_line + 1
                 len_curr = current.end_line - current.start_line + 1
+                min_len = min(len_prev, len_curr)
 
-                # Merge if overlap is > 50% of the smaller chunk, or if `prev` entirely engulfs `current`
-                if (
-                    overlap / min(len_prev, len_curr) > 0.5
-                    or current.end_line <= prev.end_line
-                ):
+                # Division by zero guard for malformed 0-line spans
+                if min_len <= 0:
+                    merged.append(prev)
+                    prev = current
+                    continue
+
+                # Merge if overlap is > 50% of smaller chunk, or if `prev` entirely engulfs `current`
+                if overlap / min_len > 0.5 or current.end_line <= prev.end_line:
                     new_lines_count = current.end_line - prev.end_line
 
                     if new_lines_count > 0:
-                        # Grab the exact new lines from the end of `current` to bypass chunker headers
+                        # Grab exact new lines from end of `current` to bypass chunker headers
                         curr_lines = current.chunk_text.split("\n")
                         # Handle potential trailing newline splits
                         if curr_lines and curr_lines[-1] == "":
