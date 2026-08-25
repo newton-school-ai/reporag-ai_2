@@ -31,9 +31,9 @@ The layout mirrors :mod:`reporag.agent.planner` and
 
 * **Pure module-level helpers** -- :func:`normalize_sub_query_answers`,
   :func:`extract_file_index`, :func:`resolve_context_window` and
-  :func:`truncate_context_blocks` are free functions with no side effects
-  and no I/O, so every interesting behaviour is unit-testable without
-  constructing a builder.
+  :func:`fit_context_blocks` are free functions with no side effects and no
+  I/O, so every interesting behaviour is unit-testable without constructing
+  a builder.
 * **Offline and dependency-free** -- no LLM, no network, no model
   download.  Token accounting reuses
   :func:`reporag.ingestion.chunker.count_tokens`, the same counter the
@@ -52,6 +52,22 @@ The layout mirrors :mod:`reporag.agent.planner` and
   at whole-chunk boundaries).  The question itself and the citation rules
   are never dropped, so an over-budget prompt degrades in quality rather
   than becoming unanswerable or raising.
+* **Fitting is verified, not estimated** -- :func:`fit_context_blocks`
+  re-renders the whole prompt for each candidate context and binary-searches
+  the largest prefix of chunks that fits, so what is measured is exactly
+  what gets sent.  A formula computed once up front would be wrong either
+  way: keeping a chunk also grows the FILES IN CONTEXT index derived from
+  it, and BPE token counts are not additive across a join.  Because every
+  kept chunk only adds tokens, the search is ``O(log n)`` renders.
+* **Score-aware trimming where the scores still exist** --
+  :meth:`PromptBuilder.build_prompt` takes an assembled string, in which
+  per-chunk scores are gone and chunks sit in file/line reading order, so it
+  can only trim from the end: a position, not a relevance judgement.
+  :meth:`PromptBuilder.build_from_results` still holds the
+  :class:`~reporag.retrieval.vector_search.RetrievalResult` objects, so
+  instead of trimming it re-assembles at a smaller ``max_tokens`` and lets
+  ContextAssembler re-pick by score.  Callers holding results should prefer
+  it.
 
 Sections of a built prompt, in order::
 
@@ -67,9 +83,8 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from math import ceil
 from typing import Any
 
 from reporag.agent.planner import QueryType
@@ -85,10 +100,10 @@ __all__ = [
     "PromptTemplate",
     "SubQueryAnswer",
     "extract_file_index",
+    "fit_context_blocks",
     "normalize_sub_query_answers",
     "resolve_context_window",
     "split_context_blocks",
-    "truncate_context_blocks",
 ]
 
 
@@ -160,16 +175,11 @@ _DEFAULT_COMPLETION_RESERVE = 1024
 # it costs a rejected API call.
 _DEFAULT_CONTEXT_WINDOW = 8_192
 
-# Trimming the code context also shrinks the FILES IN CONTEXT index derived
-# from it, so one pass can leave the prompt slightly larger than predicted.
-# A couple of extra passes converge; the cap stops a pathological input from
-# looping.
-_MAX_TRUNCATION_PASSES = 4
-
-# BPE token counts are not additive across a concatenation, so the allowance
-# computed for the code context is shaded by a few tokens rather than being
-# spent to the last one.
-_TRUNCATION_SAFETY_MARGIN = 16
+# Maximum times build_from_results re-assembles at a smaller context budget
+# to let ContextAssembler's score-based selection choose which chunks
+# survive.  Each round strictly shrinks the budget, so this is a backstop,
+# not the usual exit.
+_MAX_REASSEMBLY_ROUNDS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -418,61 +428,69 @@ def split_context_blocks(context: str) -> list[str]:
     return _CONTEXT_BLOCK_SPLIT_RE.split(context)
 
 
-def truncate_context_blocks(
-    context: str,
-    max_tokens: int,
-    *,
-    per_block_extra_tokens: int = 0,
-) -> tuple[str, bool]:
-    """Trim *context* to *max_tokens*, cutting only at whole-chunk boundaries.
+def _join_blocks(blocks: Sequence[str], truncated: bool) -> str:
+    """Join *blocks* back into a context string, marking it when shortened."""
+    parts = [*blocks, _TRUNCATION_MARKER] if truncated else list(blocks)
+    return "\n\n".join(parts)
 
-    Splitting mid-chunk would hand the model a code block with no header (so
-    nothing it could legally cite) or an unterminated fence, so blocks are
-    kept whole: the leading blocks are retained in order -- which is
-    ContextAssembler's reading order, highest-value first for a
-    file-oriented answer -- and the rest are replaced by
-    :data:`_TRUNCATION_MARKER` so the model knows its view is partial.
+
+def fit_context_blocks(
+    blocks: Sequence[str],
+    budget: int,
+    measure: Callable[[str], int],
+) -> tuple[str, bool]:
+    """Keep the largest leading run of *blocks* whose rendered cost fits *budget*.
+
+    Fitting is **verified, not estimated**.  A context block does not cost
+    only its own tokens: keeping it also adds a line to the FILES IN CONTEXT
+    index, and BPE token counts are not additive across a join, so any
+    formula computed once up front is wrong in one direction or the other.
+    *measure* renders the whole prompt for a candidate context and returns
+    its real token count, so what is checked is exactly what will be sent.
+
+    Because every kept block only ever adds tokens, ``measure`` is monotonic
+    in the number of blocks kept, so the largest fitting prefix is found by
+    binary search: ``O(log n)`` renders rather than one per block.
+
+    Blocks are kept or dropped whole at a ``## file (lines a-b)`` boundary.
+    Splitting mid-block would hand the model an unterminated code fence, or
+    code with no header above it -- and therefore nothing it could legally
+    cite.
 
     Args:
-        context: The assembled context block.
-        max_tokens: The token allowance for the result, marker included.
-        per_block_extra_tokens: Tokens each kept block costs *outside* the
-            context body.  The caller uses this to charge each block for the
-            FILES IN CONTEXT line it will generate, so keeping a block never
-            silently pushes the surrounding prompt over budget.
+        blocks: The context blocks, in priority order (highest first).
+        budget: The token ceiling for the rendered prompt.
+        measure: Renders a candidate context string and returns the token
+            count of the complete prompt containing it.
 
     Returns:
         A ``(context, truncated)`` tuple.  ``truncated`` is ``True`` when at
-        least one block was dropped.
+        least one block was dropped.  ``("", True)`` means not even the
+        truncation marker fits, so the context was dropped outright.
     """
-    context = (context or "").strip()
-    if not context:
+    if not blocks:
         return "", False
-    if count_tokens(context) <= max_tokens and not per_block_extra_tokens:
-        return context, False
+    if measure(_join_blocks(blocks, truncated=False)) <= budget:
+        return _join_blocks(blocks, truncated=False), False
 
-    marker_tokens = count_tokens(_TRUNCATION_MARKER)
-    blocks = _CONTEXT_BLOCK_SPLIT_RE.split(context)
+    # Largest k in [0, len(blocks) - 1] whose rendered prompt fits.  Every
+    # candidate here is truncated by construction (the full set was just
+    # rejected above), so each carries the marker's cost.
+    low, high = 0, len(blocks) - 1
+    best = -1
+    while low <= high:
+        mid = (low + high) // 2
+        if measure(_join_blocks(blocks[:mid], truncated=True)) <= budget:
+            best = mid
+            low = mid + 1
+        else:
+            high = mid - 1
 
-    kept: list[str] = []
-    used = 0
-    for block in blocks:
-        # +2 accounts for the blank line joining this block to the previous.
-        block_tokens = count_tokens(block) + per_block_extra_tokens + (2 if kept else 0)
-        # Every block but the last must leave room for the marker.
-        needed = used + block_tokens
-        if len(kept) + 1 < len(blocks):
-            needed += marker_tokens
-        if needed > max_tokens:
-            break
-        kept.append(block)
-        used += block_tokens
-
-    if len(kept) == len(blocks):
-        return context, False
-    if not kept:
-        return _TRUNCATION_MARKER, True
-    return "\n\n".join([*kept, _TRUNCATION_MARKER]), True
+    if best < 0:
+        # Not even a lone marker fits: drop the context rather than emit a
+        # prompt whose only code content is an apology for having none.
+        return "", True
+    return _join_blocks(blocks[:best], truncated=True), True
 
 
 # ---------------------------------------------------------------------------
@@ -997,7 +1015,6 @@ class PromptBuilder:
         include_prior = bool(answers)
         dropped: list[str] = []
         truncated = False
-        truncation_passes = 0
         exhausted = False
 
         while True:
@@ -1042,33 +1059,35 @@ class PromptBuilder:
             # Everything left is the code context plus the rules and the
             # question.  Trim the context; the rest is never dropped.
             #
-            # Two things shrink together: the context body and the FILES IN
-            # CONTEXT index derived from it.  Charging the index at its
-            # current (pre-trim) size would starve the context, so it is
-            # billed per block instead -- each surviving block pays for the
-            # index line it will generate.
-            blocks = split_context_blocks(working_context)
-            index_tokens = (
-                count_tokens(_render_file_index(working_context))
-                if self.include_file_index
-                else 0
+            # The cost of a block is not just its own tokens -- keeping it
+            # also adds a line to the FILES IN CONTEXT index derived from
+            # the context.  So the measure below renders the *whole* prompt
+            # for each candidate rather than estimating from a token split,
+            # and what is checked is exactly what gets sent.
+            # Defaults bind the current render state into the closure, so
+            # the measure can never drift from the prompt being fitted.
+            def measure(
+                candidate: str,
+                _system: str = system,
+                _prior: bool = include_prior,
+            ) -> int:
+                rendered_user = self._render_user(
+                    query, candidate, answers if _prior else ()
+                )
+                return count_tokens(f"{_system}\n\n{rendered_user}")
+
+            shorter, did_truncate = fit_context_blocks(
+                split_context_blocks(working_context), budget, measure
             )
-            per_block_index = ceil(index_tokens / len(blocks)) if blocks else 0
-            overhead = tokens - count_tokens(working_context) - index_tokens
-            allowance = budget - overhead - _TRUNCATION_SAFETY_MARGIN
-            shorter, did_truncate = truncate_context_blocks(
-                working_context,
-                max(0, allowance),
-                per_block_extra_tokens=per_block_index,
-            )
-            truncation_passes += 1
             truncated = truncated or did_truncate
-            # Nothing left to trim, or the passes are spent: render once
-            # more (so `text` matches `working_context`) and stop.
-            exhausted = (
-                shorter == working_context
-                or truncation_passes >= _MAX_TRUNCATION_PASSES
-            )
+            if did_truncate and not shorter:
+                # Not even the marker fits: the context is gone entirely,
+                # not merely shortened.  Report that distinctly so a caller
+                # can tell "you saw less code" from "you saw none".
+                dropped.append("context")
+            # One more render so `text` matches `working_context`; the
+            # measured fit means that render is final.
+            exhausted = True
             working_context = shorter
 
         sections = {
@@ -1113,12 +1132,21 @@ class PromptBuilder:
     ) -> BuiltPrompt:
         """Assemble *results* into a context block and build the prompt from it.
 
-        A convenience for the Issue 26 API layer, which holds
-        :class:`~reporag.retrieval.vector_search.RetrievalResult` objects
-        rather than an assembled string.  The assembler is budgeted at
-        :data:`_CONTEXT_BUDGET_FRACTION` of the prompt budget, leaving room
-        for the rules, the examples, and the prior findings; anything that
-        still does not fit is trimmed by :meth:`build_prompt`.
+        Prefer this over :meth:`build_prompt` whenever the caller still has
+        the retrieval results, because it chooses *better* chunks under
+        pressure.  :meth:`build_prompt` receives an already-assembled
+        string, in which the per-chunk scores are gone and the chunks sit in
+        file/line reading order -- so trimming it can only drop from the
+        end, which is a position, not a relevance judgement.  Here, a
+        context that had to be trimmed is instead re-assembled at a smaller
+        ``max_tokens``, letting
+        :class:`~reporag.generation.context_assembler.ContextAssembler` re-run
+        its own score-based selection and surface the *highest-ranked*
+        chunks that fit.
+
+        Each round shrinks the assembler budget to what actually survived
+        the previous one, so it converges in a round or two;
+        :data:`_MAX_REASSEMBLY_ROUNDS` is the backstop.
 
         Args:
             query: The user's question.
@@ -1131,29 +1159,71 @@ class PromptBuilder:
             A :class:`BuiltPrompt`.
         """
         budget = max_tokens if max_tokens is not None else self.token_budget
-        assembler = self._get_assembler(budget)
-        context = assembler.assemble(list(results)) if results else ""
-        return self.build_prompt(
-            query,
-            query_type=query_type,
-            context=context,
-            sub_query_answers=sub_query_answers,
-            max_tokens=max_tokens,
-        )
+        if not results:
+            return self.build_prompt(
+                query,
+                query_type=query_type,
+                context="",
+                sub_query_answers=sub_query_answers,
+                max_tokens=max_tokens,
+            )
+
+        results = list(results)
+        context_budget = max(1, int(budget * _CONTEXT_BUDGET_FRACTION))
+        built: BuiltPrompt | None = None
+
+        for round_index in range(_MAX_REASSEMBLY_ROUNDS):
+            assembler = self._assembler_for(context_budget, round_index == 0)
+            built = self.build_prompt(
+                query,
+                query_type=query_type,
+                context=assembler.assemble(results),
+                sub_query_answers=sub_query_answers,
+                max_tokens=max_tokens,
+            )
+            if not built.truncated:
+                break
+
+            # The prompt had to be trimmed, so the assembler was asked for
+            # more context than the prompt could hold.  Ask again for only
+            # what survived: the assembler then re-picks by score within
+            # that smaller budget instead of us keeping whatever happened to
+            # sit at the front of the string.
+            survived = count_tokens(built.sections["context"])
+            next_budget = min(context_budget - 1, max(1, survived))
+            if next_budget >= context_budget or next_budget < 1:
+                break
+            context_budget = next_budget
+
+        # The loop always runs at least once, so `built` is set; the check
+        # keeps type checkers happy without an assert in production code.
+        if built is None:  # pragma: no cover - unreachable
+            raise RuntimeError("build_from_results produced no prompt.")
+        return built
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _get_assembler(self, budget: int) -> Any:
-        """Return the injected assembler, or lazily build a budgeted one."""
+    def _assembler_for(self, context_budget: int, first_round: bool) -> Any:
+        """Return an assembler budgeted at *context_budget*.
+
+        An injected assembler is used verbatim on the first round -- the
+        caller configured it deliberately.  Later rounds of the shrinking
+        loop need a smaller budget, so another of the same type is built;
+        a test double whose constructor does not take ``max_tokens`` falls
+        back to the injected instance, which simply ends the loop.
+        """
         if self._assembler is None:
             from reporag.generation.context_assembler import ContextAssembler
 
-            self._assembler = ContextAssembler(
-                max_tokens=max(1, int(budget * _CONTEXT_BUDGET_FRACTION))
-            )
-        return self._assembler
+            return ContextAssembler(max_tokens=context_budget)
+        if first_round:
+            return self._assembler
+        try:
+            return type(self._assembler)(max_tokens=context_budget)
+        except TypeError:
+            return self._assembler
 
     @staticmethod
     def _render_rules(template: PromptTemplate) -> str:

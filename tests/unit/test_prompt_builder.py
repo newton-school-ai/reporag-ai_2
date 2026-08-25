@@ -15,10 +15,12 @@ from reporag.generation.prompt_builder import (
     PromptBuilder,
     SubQueryAnswer,
     extract_file_index,
+    fit_context_blocks,
     normalize_sub_query_answers,
     resolve_context_window,
-    truncate_context_blocks,
+    split_context_blocks,
 )
+from reporag.ingestion.chunker import count_tokens
 from reporag.retrieval.vector_search import RetrievalResult
 
 QUERY_TYPES = ("simple-lookup", "multi-hop", "exploratory")
@@ -467,30 +469,67 @@ def test_per_call_max_tokens_overrides_the_builder_budget() -> None:
         builder.build_prompt("q", max_tokens=-5)
 
 
-def test_truncate_context_blocks_keeps_whole_blocks() -> None:
-    context = "\n\n".join(
-        f"## f{i}.py (lines 1-2)\n```python\nx = {i}\n```" for i in range(10)
+def make_blocks(count: int) -> list[str]:
+    return split_context_blocks(
+        "\n\n".join(
+            f"## f{i}.py (lines 1-2)\n```python\nx = {i}\n```" for i in range(count)
+        )
     )
-    truncated, was_truncated = truncate_context_blocks(context, 60)
-
-    assert was_truncated
-    assert "## f0.py" in truncated
-    assert "code context truncated" in truncated
-    assert truncated.count("```") % 2 == 0
 
 
-def test_truncate_context_blocks_is_a_no_op_when_it_fits() -> None:
-    context = "## f0.py (lines 1-2)\n```python\nx = 0\n```"
-    assert truncate_context_blocks(context, 10_000) == (context, False)
-    assert truncate_context_blocks("", 10) == ("", False)
+def test_fit_context_blocks_keeps_whole_blocks() -> None:
+    blocks = make_blocks(10)
+    fitted, truncated = fit_context_blocks(blocks, 60, count_tokens)
+
+    assert truncated
+    assert "## f0.py" in fitted
+    assert "code context truncated" in fitted
+    assert fitted.count("```") % 2 == 0
+    assert count_tokens(fitted) <= 60
 
 
-def test_truncate_context_blocks_degrades_to_the_marker() -> None:
-    context = "## f0.py (lines 1-2)\n```python\nx = 0\n```"
-    truncated, was_truncated = truncate_context_blocks(context, 1)
-    assert was_truncated
-    assert truncated == truncate_context_blocks(context, 1)[0]
-    assert "truncated" in truncated
+def test_fit_context_blocks_is_a_no_op_when_everything_fits() -> None:
+    blocks = make_blocks(3)
+    fitted, truncated = fit_context_blocks(blocks, 10_000, count_tokens)
+
+    assert not truncated
+    assert fitted == "\n\n".join(blocks)
+    assert "truncated" not in fitted
+    assert fit_context_blocks([], 10, count_tokens) == ("", False)
+
+
+def test_fit_context_blocks_finds_the_exact_largest_fitting_prefix() -> None:
+    """Binary search must return the same answer as a linear scan."""
+    blocks = make_blocks(40)
+    # Recover the marker the module appends, without reaching into privates.
+    marker = fit_context_blocks(blocks, 60, count_tokens)[0].split("\n\n")[-1]
+
+    for budget in (30, 80, 150, 400, 900):
+        fitted, _ = fit_context_blocks(blocks, budget, count_tokens)
+        kept = fitted.count("## f")
+
+        assert count_tokens(fitted) <= budget
+        # One more block would not have fit -- the fit is tight, not timid.
+        if kept < len(blocks):
+            one_more = "\n\n".join([*blocks[: kept + 1], marker])
+            assert count_tokens(one_more) > budget
+
+
+def test_fit_context_blocks_measures_the_whole_prompt_not_just_the_context() -> None:
+    """The measure sees the rendered prompt, so fixed overhead is charged."""
+    blocks = make_blocks(10)
+    overhead = 1_000
+
+    fitted, truncated = fit_context_blocks(
+        blocks, 1_050, lambda ctx: overhead + count_tokens(ctx)
+    )
+    assert truncated
+    assert overhead + count_tokens(fitted) <= 1_050
+
+
+def test_fit_context_blocks_drops_the_context_when_not_even_the_marker_fits() -> None:
+    fitted, truncated = fit_context_blocks(make_blocks(3), 1, count_tokens)
+    assert (fitted, truncated) == ("", True)
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +622,66 @@ def test_build_from_results_assembles_then_builds() -> None:
 def test_build_from_results_without_results_uses_the_empty_context_note() -> None:
     built = PromptBuilder().build_from_results("Where is login?", "simple-lookup")
     assert "No code was retrieved for this query" in built.text
+
+
+def test_build_from_results_reassembles_by_score_under_pressure() -> None:
+    """A trimmed context is re-assembled smaller, so the top-scored chunks win.
+
+    Passing the same results as a pre-assembled string can only drop from
+    the end of the reading order, which loses high-scoring chunks that
+    happen to sort late by file path. Going through the assembler keeps
+    them.
+    """
+    # aaa.py sorts first but scores lowest; zzz.py sorts last but scores
+    # highest -- exactly the case string-position truncation gets wrong.
+    results = [
+        make_result(
+            0.1, "src/aaa.py", 1, 200, "\n".join(f"low_{i}" for i in range(200))
+        ),
+        make_result(0.9, "src/zzz.py", 1, 4, "def critical():\n    return 1"),
+    ]
+    budget = 800
+
+    from_string = PromptBuilder(max_tokens=budget).build_prompt(
+        "How does it work?",
+        "multi-hop",
+        ContextAssembler(max_tokens=4000).assemble(results),
+    )
+    from_results = PromptBuilder(max_tokens=budget).build_from_results(
+        "How does it work?", "multi-hop", results
+    )
+
+    assert from_results.token_count <= budget
+    # The high-scoring chunk survives the assembler path...
+    assert "src/zzz.py" in from_results.sections["context"]
+    # ...and is exactly what the string path drops.
+    assert "src/zzz.py" not in from_string.sections["context"]
+
+
+def test_build_from_results_always_fits_the_budget() -> None:
+    results = [
+        make_result(
+            1.0 - i / 100, f"src/mod_{i:03d}.py", 1, 3, f"def f_{i}():\n    x={i}"
+        )
+        for i in range(100)
+    ]
+    for budget in (700, 1200, 2500):
+        built = PromptBuilder(max_tokens=budget).build_from_results(
+            "How does auth work?", "multi-hop", results
+        )
+        assert built.token_count <= budget, budget
+        assert built.fits_budget
+
+
+def test_context_dropped_entirely_is_reported_distinctly() -> None:
+    built = PromptBuilder(max_tokens=1).build_prompt(
+        "Where is login_route defined?", "simple-lookup", CONTEXT
+    )
+    assert built.truncated
+    assert "context" in built.dropped_sections
+    assert built.sections["context"] == ""
+    # The question survives even when nothing else does.
+    assert "Where is login_route defined?" in built.text
 
 
 def test_build_from_results_accepts_an_injected_assembler() -> None:
