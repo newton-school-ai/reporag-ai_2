@@ -15,9 +15,12 @@ from reporag.db.session import get_async_database_url
 config = context.config
 
 # Interpret the config file for Python logging.
-# This line sets up loggers basically.
+# ``disable_existing_loggers=False`` matters: the default is True, which
+# silently switches off every logger created before this runs -- which is
+# every ``reporag.*`` module logger whenever alembic is driven in-process
+# (the migration tests do exactly that).
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Set the target metadata for autogenerate support
 target_metadata = Base.metadata
