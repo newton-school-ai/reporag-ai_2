@@ -22,6 +22,8 @@ Beyond the acceptance criteria, the suite pins the design contract:
 No test makes a real network, database, LLM or Hugging Face call: the
 database is a temporary SQLite file and every pipeline component is a
 hand-written fake injected through ``app.state`` or ``dependency_overrides``.
+The ``api_app``, ``client`` and ``stub_ingestion`` fixtures come from
+``tests/conftest.py``, shared with the integration suite.
 """
 
 from __future__ import annotations
@@ -30,14 +32,18 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from reporag.api.main import create_app
 from reporag.api.routes import query as query_routes
 from reporag.api.routes import repos as repos_routes
 from reporag.api.routes.repos import run_ingestion as real_run_ingestion
-from reporag.db.models import Base, Repository, RepositoryStatus, User
+from reporag.db.models import (
+    IngestionJob,
+    JobStatus,
+    Repository,
+    RepositoryStatus,
+    User,
+)
 from reporag.db.session import get_db
 from reporag.generation.citation import Citation, CitationReport
 from reporag.generation.generator import AnsweredQuery, GenerationResult
@@ -210,50 +216,7 @@ def _result(
 
 
 @pytest.fixture
-def db_url(tmp_path: Any) -> str:
-    """Create a real SQLite file with the schema applied.
-
-    A file rather than ``:memory:`` so the schema created here is visible to
-    the async engine the app uses; an in-memory database would be private to
-    the connection that created it.
-    """
-    path = tmp_path / "test.db"
-    sync_engine = create_engine(f"sqlite:///{path}")
-    Base.metadata.create_all(sync_engine)
-    sync_engine.dispose()
-    return f"sqlite+aiosqlite:///{path}"
-
-
-@pytest.fixture
-def app(db_url: str) -> Any:
-    """Build an isolated app wired to the temporary database.
-
-    ``create_app`` is used rather than the module-level ``app`` because the
-    query route caches pipeline components on ``app.state``; a shared
-    instance would leak one test's fakes into the next.
-    """
-    application = create_app()
-    engine = create_async_engine(db_url)
-    session_maker = async_sessionmaker(engine, expire_on_commit=False)
-
-    async def override_get_db() -> Any:
-        async with session_maker() as session:
-            yield session
-
-    application.dependency_overrides[get_db] = override_get_db
-    application.state.session_maker = session_maker
-    return application
-
-
-@pytest.fixture
-def client(app: Any) -> Any:
-    """A ``TestClient`` bound to the isolated app."""
-    with TestClient(app) as test_client:
-        yield test_client
-
-
-@pytest.fixture
-def pipeline(app: Any) -> dict[str, Any]:
+def pipeline(api_app: Any) -> dict[str, Any]:
     """Install fake pipeline components and return them for assertions."""
     components = {
         "engine": object(),
@@ -262,22 +225,18 @@ def pipeline(app: Any) -> dict[str, Any]:
         "prompt_builder": _FakePromptBuilder(),
         "generator": _FakeGenerator(),
     }
-    app.state.pipeline = components
+    api_app.state.pipeline = components
     return components
 
 
 @pytest.fixture(autouse=True)
-def _no_real_ingestion(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
-    """Replace the background ingestion task so no test clones a repository."""
-    calls: list[tuple[Any, ...]] = []
+def _never_clone(stub_ingestion: list[tuple[Any, ...]]) -> None:
+    """Route every test in this module through the ingestion stub.
 
-    async def fake_run_ingestion(
-        repo_id: int, repo_url: str, branch: str | None
-    ) -> None:
-        calls.append((repo_id, repo_url, branch))
-
-    monkeypatch.setattr(repos_routes, "run_ingestion", fake_run_ingestion)
-    return calls
+    Autouse so no test can clone a repository by forgetting to ask for it;
+    tests that assert on the scheduled call request ``stub_ingestion``
+    itself, which resolves to the same recorded list.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -425,17 +384,17 @@ class TestComponentHealth:
         assert _check_llm().status == "ok"
 
     def test_database_probe_failure_is_reported(
-        self, app: Any, monkeypatch: pytest.MonkeyPatch
+        self, api_app: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         async def broken_db() -> Any:
             raise ConnectionError("db down")
             yield  # pragma: no cover
 
         _stub_probes(monkeypatch)
-        app.dependency_overrides[get_db] = broken_db
+        api_app.dependency_overrides[get_db] = broken_db
         # raise_server_exceptions=False so the app's own 500 handler renders
         # the response instead of TestClient re-raising into the test.
-        with TestClient(app, raise_server_exceptions=False) as broken_client:
+        with TestClient(api_app, raise_server_exceptions=False) as broken_client:
             # The dependency itself fails, so the shared error shape applies.
             response = broken_client.get("/api/v1/health")
         assert response.status_code == 500
@@ -459,16 +418,45 @@ class TestIngestRepository:
         assert body["branch"] == "main"
 
     def test_schedules_the_background_task(
-        self, client: Any, _no_real_ingestion: list[tuple[Any, ...]]
+        self, client: Any, stub_ingestion: list[tuple[Any, ...]]
     ) -> None:
         client.post(
             "/api/v1/repos/ingest",
             json={"repo_url": "https://github.com/pallets/click", "branch": "main"},
         )
-        assert len(_no_real_ingestion) == 1
-        _, url, branch = _no_real_ingestion[0]
+        assert len(stub_ingestion) == 1
+        _, url, branch, _ = stub_ingestion[0]
         assert url == "https://github.com/pallets/click"
         assert branch == "main"
+
+    def test_records_an_ingestion_job(self, client: Any) -> None:
+        body = client.post(
+            "/api/v1/repos/ingest",
+            json={"repo_url": "https://github.com/pallets/click"},
+        ).json()
+        # The attempt is recorded in its own row, so a later re-ingest can
+        # be told apart from this one.
+        assert body["job_id"] >= 1
+
+    def test_the_job_is_handed_to_the_background_task(
+        self, client: Any, stub_ingestion: list[tuple[Any, ...]]
+    ) -> None:
+        body = client.post(
+            "/api/v1/repos/ingest",
+            json={"repo_url": "https://github.com/pallets/click"},
+        ).json()
+        repo_id, _, _, job_id = stub_ingestion[0]
+        assert repo_id == body["repository"]["id"]
+        assert job_id == body["job_id"]
+
+    async def test_the_job_starts_pending(self, client: Any, db_session: Any) -> None:
+        body = client.post(
+            "/api/v1/repos/ingest",
+            json={"repo_url": "https://github.com/pallets/click"},
+        ).json()
+        job = await db_session.get(IngestionJob, body["job_id"])
+        assert job.status == JobStatus.PENDING
+        assert job.repository_id == body["repository"]["id"]
 
     def test_derives_repository_name_from_url(self, client: Any) -> None:
         body = client.post(
@@ -509,21 +497,61 @@ class TestIngestRepository:
 
 
 class TestListRepositories:
+    @staticmethod
+    def _ingest(client: Any, name: str) -> None:
+        client.post(
+            "/api/v1/repos/ingest",
+            json={"repo_url": f"https://github.com/acme/{name}"},
+        )
+
     def test_empty_by_default(self, client: Any) -> None:
-        assert client.get("/api/v1/repos").json() == []
+        body = client.get("/api/v1/repos").json()
+        assert body["repositories"] == []
+        assert body["total"] == 0
 
     def test_lists_ingested_repositories_with_status(self, client: Any) -> None:
-        client.post(
-            "/api/v1/repos/ingest",
-            json={"repo_url": "https://github.com/pallets/click"},
-        )
-        client.post(
-            "/api/v1/repos/ingest",
-            json={"repo_url": "https://github.com/psf/requests"},
-        )
+        self._ingest(client, "click")
+        self._ingest(client, "requests")
         body = client.get("/api/v1/repos").json()
-        assert [r["name"] for r in body] == ["click", "requests"]
-        assert all(r["status"] == RepositoryStatus.QUEUED.value for r in body)
+        # Newest first, so the second ingest leads.
+        assert [r["name"] for r in body["repositories"]] == ["requests", "click"]
+        assert all(
+            r["status"] == RepositoryStatus.QUEUED.value for r in body["repositories"]
+        )
+        assert body["total"] == 2
+
+    def test_reports_timestamps(self, client: Any) -> None:
+        self._ingest(client, "click")
+        repo = client.get("/api/v1/repos").json()["repositories"][0]
+        # A client showing "queued 3 minutes ago" needs these; without them
+        # a stalled ingest is indistinguishable from a fresh one.
+        assert repo["created_at"] and repo["updated_at"]
+
+    def test_page_is_bounded_and_total_is_not(self, client: Any) -> None:
+        for name in ("a", "b", "c"):
+            self._ingest(client, name)
+        body = client.get("/api/v1/repos?limit=2").json()
+        assert len(body["repositories"]) == 2
+        # total counts what exists, not what fits on the page.
+        assert body["total"] == 3
+        assert body["limit"] == 2
+
+    def test_offset_walks_the_pages_without_repeating(self, client: Any) -> None:
+        for name in ("a", "b", "c"):
+            self._ingest(client, name)
+        first = client.get("/api/v1/repos?limit=2&offset=0").json()["repositories"]
+        second = client.get("/api/v1/repos?limit=2&offset=2").json()["repositories"]
+        assert len(second) == 1
+        assert {r["id"] for r in first}.isdisjoint({r["id"] for r in second})
+
+    @pytest.mark.parametrize("query", ["limit=0", "limit=201", "offset=-1"])
+    def test_out_of_range_paging_is_rejected(self, client: Any, query: str) -> None:
+        # Rejected rather than silently clamped: a client asking for 500
+        # rows should learn the ceiling exists, not get 200 and assume it
+        # received everything.
+        response = client.get(f"/api/v1/repos?{query}")
+        assert response.status_code == 422
+        assert response.json()["error"] == "validation_error"
 
     @pytest.mark.parametrize(
         "state",
@@ -536,12 +564,12 @@ class TestListRepositories:
         ],
     )
     def test_every_status_round_trips(
-        self, app: Any, client: Any, state: RepositoryStatus
+        self, api_app: Any, client: Any, state: RepositoryStatus
     ) -> None:
         import anyio
 
         async def seed() -> None:
-            async with app.state.session_maker() as session:
+            async with api_app.state.session_maker() as session:
                 user = User(username="u", email="u@example.com", hashed_password="!")
                 session.add(user)
                 await session.flush()
@@ -557,7 +585,7 @@ class TestListRepositories:
 
         anyio.run(seed)
         body = client.get("/api/v1/repos").json()
-        assert body[0]["status"] == state.value
+        assert body["repositories"][0]["status"] == state.value
 
 
 class TestGetRepository:
@@ -591,9 +619,13 @@ class TestBackgroundIngestion:
     """
 
     @staticmethod
-    async def _seed_repo(app: Any) -> int:
-        """Insert a queued repository and return its id."""
-        async with app.state.session_maker() as session:
+    async def _seed_repo(api_app: Any) -> tuple[int, int]:
+        """Insert a queued repository with a pending job.
+
+        Returns:
+            The repository id and the job id, as the route would produce.
+        """
+        async with api_app.state.session_maker() as session:
             user = User(username="u", email="u@example.com", hashed_password="!")
             session.add(user)
             await session.flush()
@@ -604,22 +636,32 @@ class TestBackgroundIngestion:
                 status=RepositoryStatus.QUEUED,
             )
             session.add(repo)
+            await session.flush()
+            job = IngestionJob(repository_id=repo.id, status=JobStatus.PENDING)
+            session.add(job)
             await session.commit()
-            return repo.id
+            return repo.id, job.id
 
     @staticmethod
-    async def _status(app: Any, repo_id: int) -> RepositoryStatus:
+    async def _status(api_app: Any, repo_id: int) -> RepositoryStatus:
         """Read a repository's current status."""
-        async with app.state.session_maker() as session:
+        async with api_app.state.session_maker() as session:
             repo = await session.get(Repository, repo_id)
             return repo.status
 
+    @staticmethod
+    async def _job_status(api_app: Any, job_id: int) -> JobStatus:
+        """Read an ingestion job's current status."""
+        async with api_app.state.session_maker() as session:
+            job = await session.get(IngestionJob, job_id)
+            return job.status
+
     async def test_successful_run_ends_ready(
-        self, app: Any, monkeypatch: pytest.MonkeyPatch
+        self, api_app: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        repo_id = await self._seed_repo(app)
+        repo_id, job_id = await self._seed_repo(api_app)
         monkeypatch.setattr(
-            repos_routes, "async_session_maker", app.state.session_maker
+            repos_routes, "async_session_maker", api_app.state.session_maker
         )
         monkeypatch.setattr(
             repos_routes,
@@ -628,30 +670,31 @@ class TestBackgroundIngestion:
                 files=3, symbols=10, chunks=12, languages=["python"]
             ),
         )
-        await real_run_ingestion(repo_id, "https://example.com/demo", None)
-        assert await self._status(app, repo_id) == RepositoryStatus.READY
+        await real_run_ingestion(repo_id, "https://example.com/demo", None, job_id)
+        assert await self._status(api_app, repo_id) == RepositoryStatus.READY
+        assert await self._job_status(api_app, job_id) == JobStatus.COMPLETED
 
     async def test_repository_with_no_source_files_fails(
-        self, app: Any, monkeypatch: pytest.MonkeyPatch
+        self, api_app: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        repo_id = await self._seed_repo(app)
+        repo_id, job_id = await self._seed_repo(api_app)
         monkeypatch.setattr(
-            repos_routes, "async_session_maker", app.state.session_maker
+            repos_routes, "async_session_maker", api_app.state.session_maker
         )
         monkeypatch.setattr(
             repos_routes,
             "_parse_repository",
             lambda url, branch: repos_routes._IngestionStats(files=0),
         )
-        await real_run_ingestion(repo_id, "https://example.com/demo", None)
-        assert await self._status(app, repo_id) == RepositoryStatus.FAILED
+        await real_run_ingestion(repo_id, "https://example.com/demo", None, job_id)
+        assert await self._status(api_app, repo_id) == RepositoryStatus.FAILED
 
     async def test_clone_failure_is_recorded_not_raised(
-        self, app: Any, monkeypatch: pytest.MonkeyPatch
+        self, api_app: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        repo_id = await self._seed_repo(app)
+        repo_id, job_id = await self._seed_repo(api_app)
         monkeypatch.setattr(
-            repos_routes, "async_session_maker", app.state.session_maker
+            repos_routes, "async_session_maker", api_app.state.session_maker
         )
 
         def boom(url: str, branch: str | None) -> Any:
@@ -659,24 +702,29 @@ class TestBackgroundIngestion:
 
         monkeypatch.setattr(repos_routes, "_parse_repository", boom)
         # Nothing is listening to a background task, so it must never raise.
-        await real_run_ingestion(repo_id, "https://example.com/demo", None)
-        assert await self._status(app, repo_id) == RepositoryStatus.FAILED
+        await real_run_ingestion(repo_id, "https://example.com/demo", None, job_id)
+        assert await self._status(api_app, repo_id) == RepositoryStatus.FAILED
+        assert await self._job_status(api_app, job_id) == JobStatus.FAILED
 
     async def test_progresses_through_cloning_and_processing(
-        self, app: Any, monkeypatch: pytest.MonkeyPatch
+        self, api_app: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        repo_id = await self._seed_repo(app)
+        repo_id, job_id = await self._seed_repo(api_app)
         monkeypatch.setattr(
-            repos_routes, "async_session_maker", app.state.session_maker
+            repos_routes, "async_session_maker", api_app.state.session_maker
         )
         seen: list[RepositoryStatus] = []
         original = repos_routes._set_status
 
         async def recording(
-            rid: int, new_status: RepositoryStatus, *, detail: str = ""
+            rid: int,
+            new_status: RepositoryStatus,
+            *,
+            job_id: int | None = None,
+            detail: str = "",
         ) -> None:
             seen.append(new_status)
-            await original(rid, new_status, detail=detail)
+            await original(rid, new_status, job_id=job_id, detail=detail)
 
         monkeypatch.setattr(repos_routes, "_set_status", recording)
         monkeypatch.setattr(
@@ -684,18 +732,54 @@ class TestBackgroundIngestion:
             "_parse_repository",
             lambda url, branch: repos_routes._IngestionStats(files=2, symbols=4),
         )
-        await real_run_ingestion(repo_id, "https://example.com/demo", None)
+        await real_run_ingestion(repo_id, "https://example.com/demo", None, job_id)
         assert seen == [
             RepositoryStatus.CLONING,
             RepositoryStatus.PROCESSING,
             RepositoryStatus.READY,
         ]
 
+    async def test_job_tracks_the_repository_through_the_run(
+        self, api_app: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo_id, job_id = await self._seed_repo(api_app)
+        monkeypatch.setattr(
+            repos_routes, "async_session_maker", api_app.state.session_maker
+        )
+        seen: list[JobStatus] = []
+        original = repos_routes._set_status
+
+        async def recording(
+            rid: int,
+            new_status: RepositoryStatus,
+            *,
+            job_id: int | None = None,
+            detail: str = "",
+        ) -> None:
+            await original(rid, new_status, job_id=job_id, detail=detail)
+            if job_id is not None:
+                seen.append(await self._job_status(api_app, job_id))
+
+        monkeypatch.setattr(repos_routes, "_set_status", recording)
+        monkeypatch.setattr(
+            repos_routes,
+            "_parse_repository",
+            lambda url, branch: repos_routes._IngestionStats(files=2, symbols=4),
+        )
+        await real_run_ingestion(repo_id, "https://example.com/demo", None, job_id)
+        # The two working states collapse into one job state: a job is a
+        # single attempt, not a mirror of the repository's status.
+        assert seen == [
+            JobStatus.IN_PROGRESS,
+            JobStatus.IN_PROGRESS,
+            JobStatus.COMPLETED,
+        ]
+
     async def test_missing_repository_row_is_survivable(
-        self, app: Any, monkeypatch: pytest.MonkeyPatch
+        self, api_app: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(
-            repos_routes, "async_session_maker", app.state.session_maker
+            repos_routes, "async_session_maker", api_app.state.session_maker
         )
         monkeypatch.setattr(
             repos_routes,
@@ -704,6 +788,23 @@ class TestBackgroundIngestion:
         )
         # A repository deleted mid-ingest must not crash the task.
         await real_run_ingestion(4242, "https://example.com/demo", None)
+
+    async def test_missing_job_row_does_not_stop_the_repository(
+        self, api_app: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo_id, _ = await self._seed_repo(api_app)
+        monkeypatch.setattr(
+            repos_routes, "async_session_maker", api_app.state.session_maker
+        )
+        monkeypatch.setattr(
+            repos_routes,
+            "_parse_repository",
+            lambda url, branch: repos_routes._IngestionStats(files=1),
+        )
+        # Status on the repository is what clients poll, so losing the job
+        # row must not cost them that.
+        await real_run_ingestion(repo_id, "https://example.com/demo", None, 9999)
+        assert await self._status(api_app, repo_id) == RepositoryStatus.READY
 
 
 class TestIngestionStats:
@@ -1058,21 +1159,50 @@ class TestOpenAPI:
 
 
 class TestErrorShape:
-    def test_unhandled_exception_returns_clean_json(
-        self, app: Any, pipeline: dict[str, Any]
+    def test_pipeline_failure_is_reported_as_bad_gateway(
+        self, client: Any, pipeline: dict[str, Any]
     ) -> None:
         class _Exploding:
             def decompose(self, query: str, repo_context: Any = None) -> Any:
                 raise RuntimeError("boom: /secret/path/leaked")
 
         pipeline["decomposer"] = _Exploding()
+        response = client.post("/api/v1/query", json={"question": "How?"})
+        # A broken component is an upstream failure, not a bad request.
+        assert response.status_code == 502
+        assert response.json()["error"] == "http_error"
+        # The exception text belongs in the log, never in the response: it
+        # routinely carries paths and provider payloads.
+        assert "secret" not in response.text
+
+    def test_pipeline_rejection_is_reported_as_unprocessable(
+        self, client: Any, pipeline: dict[str, Any]
+    ) -> None:
+        class _Rejecting:
+            def decompose(self, query: str, repo_context: Any = None) -> Any:
+                raise ValueError("question names no repository")
+
+        pipeline["decomposer"] = _Rejecting()
+        response = client.post("/api/v1/query", json={"question": "How?"})
+        # ValueError is the pipeline saying the input is unusable, which is
+        # the caller's to fix -- so it must not read as a server fault.
+        assert response.status_code == 422
+
+    def test_unhandled_exception_outside_the_pipeline_returns_clean_json(
+        self, api_app: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def exploding_pipeline(request: Any) -> Any:
+            raise RuntimeError("boom: /secret/path/leaked")
+
+        # Raised outside the route's own try/except, so this exercises the
+        # application-wide handler rather than the query route's mapping.
+        monkeypatch.setattr(query_routes, "get_pipeline", exploding_pipeline)
         # raise_server_exceptions=False so the app's own 500 handler renders
         # the response instead of TestClient re-raising into the test.
-        with TestClient(app, raise_server_exceptions=False) as raw_client:
+        with TestClient(api_app, raise_server_exceptions=False) as raw_client:
             response = raw_client.post("/api/v1/query", json={"question": "How?"})
         assert response.status_code == 500
-        body = response.json()
-        assert body == {
+        assert response.json() == {
             "error": "internal_error",
             "detail": "An unexpected error occurred.",
             "status_code": 500,
@@ -1081,25 +1211,127 @@ class TestErrorShape:
         assert "secret" not in response.text
 
 
+class TestStartup:
+    """The lifespan's one piece of I/O: creating the schema outside prod."""
+
+    def test_schema_is_created_on_a_fresh_database(self, tmp_path: Any) -> None:
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        from reporag.api.main import create_app
+
+        # No tables are created up front, unlike the shared fixtures: a
+        # fresh clone must be able to serve a request without a migration.
+        path = tmp_path / "fresh.db"
+        engine = create_async_engine(f"sqlite+aiosqlite:///{path}")
+        application = create_app()
+        application.state.db_engine = engine
+
+        session_maker = async_sessionmaker(engine, expire_on_commit=False)
+
+        async def override_get_db() -> Any:
+            async with session_maker() as session:
+                yield session
+
+        application.dependency_overrides[get_db] = override_get_db
+        with TestClient(application) as fresh_client:
+            response = fresh_client.post(
+                "/api/v1/repos/ingest",
+                json={"repo_url": "https://github.com/acme/demo"},
+            )
+        assert response.status_code == 202
+
+    @pytest.mark.parametrize("env", ["staging", "production"])
+    def test_managed_environments_leave_the_schema_alone(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch, env: str
+    ) -> None:
+        from sqlalchemy import inspect
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        from reporag.api.main import create_app
+        from reporag.config import settings as live_settings
+
+        monkeypatch.setattr(live_settings, "app_env", env)
+        path = tmp_path / "managed.db"
+        engine = create_async_engine(f"sqlite+aiosqlite:///{path}")
+        application = create_app()
+        application.state.db_engine = engine
+
+        with TestClient(application) as managed_client:
+            assert managed_client.get("/health").status_code == 200
+
+        # Creating tables from ORM metadata here would silently diverge
+        # from Alembic's migration history.
+        import anyio
+
+        async def tables() -> list[str]:
+            async with engine.begin() as conn:
+                return await conn.run_sync(
+                    lambda sync_conn: inspect(sync_conn).get_table_names()
+                )
+
+        assert anyio.run(tables) == []
+
+    def test_startup_survives_an_unusable_database(self) -> None:
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        from reporag.api.main import create_app
+
+        application = create_app()
+        # A directory that does not exist: the engine builds, connecting fails.
+        application.state.db_engine = create_async_engine(
+            "sqlite+aiosqlite:////nonexistent-dir/nope.db"
+        )
+        with TestClient(application) as broken_client:
+            # The endpoints that explain the problem must still be reachable;
+            # refusing to boot would take them away too.
+            assert broken_client.get("/health").status_code == 200
+
+
+class TestPipelineConstructionFailure:
+    def test_unconfigured_component_is_503_not_500(
+        self, client: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def boom() -> Any:
+            raise ValueError("ANTHROPIC_API_KEY is not set")
+
+        monkeypatch.setattr(query_routes, "_RetrievalEngineAdapter", boom)
+        response = client.post("/api/v1/query", json={"question": "How?"})
+        # An incomplete deployment, not a bug in this service and not a bad
+        # request -- and retrying right now will not help.
+        assert response.status_code == 503
+
+    def test_the_reason_stays_out_of_the_response(
+        self, client: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def boom() -> Any:
+            raise ValueError("key sk-ant-abc123 rejected at /etc/secrets/env")
+
+        monkeypatch.setattr(query_routes, "_RetrievalEngineAdapter", boom)
+        body = client.post("/api/v1/query", json={"question": "How?"}).json()
+        assert "sk-ant-abc123" not in str(body)
+        # The caller is pointed somewhere useful instead.
+        assert "health" in body["detail"]
+
+
 class TestAcceptanceCriteria:
     """One test per Issue 26 acceptance criterion."""
 
     def test_ingest_triggers_async_background_ingestion(
-        self, client: Any, _no_real_ingestion: list[tuple[Any, ...]]
+        self, client: Any, stub_ingestion: list[tuple[Any, ...]]
     ) -> None:
         response = client.post(
             "/api/v1/repos/ingest",
             json={"repo_url": "https://github.com/pallets/click"},
         )
         assert response.status_code == 202
-        assert len(_no_real_ingestion) == 1
+        assert len(stub_ingestion) == 1
 
     def test_repos_returns_list_with_status(self, client: Any) -> None:
         client.post(
             "/api/v1/repos/ingest",
             json={"repo_url": "https://github.com/pallets/click"},
         )
-        body = client.get("/api/v1/repos").json()
+        body = client.get("/api/v1/repos").json()["repositories"]
         assert body and "status" in body[0]
 
     def test_query_returns_answer_citations_metadata(

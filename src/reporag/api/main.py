@@ -21,10 +21,13 @@ Design
 * **Errors are one shape.** Any handler can raise ``HTTPException``, and
   anything unhandled would otherwise leak a stack trace. Both are rendered
   as ``{"error", "detail", "status_code"}`` so clients parse one schema.
-* **Lifespan does no I/O.** Connecting to Neo4j and Qdrant at startup would
-  make the API refuse to boot whenever a dependency is slow, and the pieces
-  that need them build lazily on first use anyway. Startup validates
-  configuration and nothing else.
+* **Lifespan touches one dependency, not four.** Connecting to Neo4j, Qdrant
+  and the LLM at startup would make the API refuse to boot whenever any of
+  them is slow, and the pieces that need them build lazily on first use
+  anyway. The relational schema is the exception: every route depends on it,
+  and outside production it is created at startup so a fresh clone runs
+  without a migration step. Staging and production leave the schema to
+  Alembic.
 """
 
 from __future__ import annotations
@@ -37,15 +40,24 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from reporag.api.routes import health as health_routes
 from reporag.api.routes import query as query_routes
 from reporag.api.routes import repos as repos_routes
 from reporag.config import settings
+from reporag.db.models import Base
+from reporag.db.session import engine as default_engine
 
 logger = logging.getLogger(__name__)
 
 API_V1_PREFIX = "/api/v1"
+
+# Environments whose schema is owned by Alembic migrations. Creating tables
+# from the ORM metadata there would silently diverge from migration history,
+# so startup leaves the schema alone and lets a missing table surface as the
+# deployment error it is.
+_ALEMBIC_MANAGED_ENVS = frozenset({"staging", "production"})
 
 DESCRIPTION = """
 Code-aware repository intelligence: ask questions about a codebase and get
@@ -58,21 +70,53 @@ answers cited to the exact file and line range.
 """
 
 
+def _db_engine(app: FastAPI) -> AsyncEngine:
+    """Return the engine this app should manage.
+
+    Tests build an isolated app against a temporary database and record its
+    engine on ``app.state.db_engine``; everything else uses the process-wide
+    engine from :mod:`reporag.db.session`. Without this seam the startup
+    hook below would create tables in the real ``reporag.db`` file every
+    time a test instantiated the app.
+    """
+    return getattr(app.state, "db_engine", None) or default_engine
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage application startup and shutdown.
 
-    Startup is intentionally I/O-free: the retrieval backends and LLM client
-    connect lazily on first use, so binding them here would only make the
-    API fail to start when a dependency is briefly unavailable, without
-    making any request faster.
+    Startup does one piece of I/O and no more. The retrieval backends and
+    LLM client connect lazily on first use, so binding them here would only
+    make the API fail to start when a dependency is briefly unavailable,
+    without making any request faster. The SQL schema is different: every
+    route holds a session, and a fresh clone has no tables, so outside
+    production the schema is created here rather than making ``POST
+    /repos/ingest`` the thing that discovers the database is empty. Under
+    ``APP_ENV=staging`` or ``production`` the schema belongs to Alembic and
+    is left alone.
     """
     logger.info(
         "RepoRAG API starting (env=%s, llm=%s)",
         settings.app_env,
         settings.llm_provider,
     )
+
+    engine = _db_engine(app)
+    if settings.app_env not in _ALEMBIC_MANAGED_ENVS:
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            logger.info("Database schema ensured (env=%s)", settings.app_env)
+        except Exception:
+            # A missing schema makes most routes fail, but not the liveness
+            # probe or the health endpoint that would explain why -- and
+            # those are exactly what an operator reaches for here. Refusing
+            # to boot would take them away too.
+            logger.exception("Could not create database schema; continuing")
+
     yield
+
     # Pipeline components cached by the query route hold Qdrant and Neo4j
     # handles; close what exposes a close().
     pipeline = getattr(app.state, "pipeline", None)
@@ -84,6 +128,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     closer()
                 except Exception:  # pragma: no cover - shutdown must not fail
                     logger.warning("Failed to close %s", name, exc_info=True)
+
+    await engine.dispose()
     logger.info("RepoRAG API stopped")
 
 

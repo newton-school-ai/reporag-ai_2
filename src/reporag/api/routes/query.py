@@ -367,6 +367,10 @@ def get_pipeline(request: Request) -> dict[str, Any]:
     Returns:
         A mapping with ``engine``, ``decomposer``, ``executor``,
         ``prompt_builder`` and ``generator`` keys.
+
+    Raises:
+        HTTPException: 503 when a component cannot be constructed at all --
+            most often an unconfigured LLM API key.
     """
     cached = getattr(request.app.state, "pipeline", None)
     if cached is not None:
@@ -377,14 +381,32 @@ def get_pipeline(request: Request) -> dict[str, Any]:
     from reporag.generation.generator import AnswerGenerator
     from reporag.generation.prompt_builder import PromptBuilder
 
-    engine = _RetrievalEngineAdapter()
-    pipeline: dict[str, Any] = {
-        "engine": engine,
-        "decomposer": QueryDecomposer(),
-        "executor": SubQueryExecutor(engine, top_k=settings.rerank_top_k),
-        "prompt_builder": PromptBuilder(),
-        "generator": AnswerGenerator(),
-    }
+    try:
+        engine = _RetrievalEngineAdapter()
+        pipeline: dict[str, Any] = {
+            "engine": engine,
+            "decomposer": QueryDecomposer(),
+            "executor": SubQueryExecutor(engine, top_k=settings.rerank_top_k),
+            "prompt_builder": PromptBuilder(),
+            "generator": AnswerGenerator(),
+        }
+    except Exception as exc:
+        # Construction failing is a deployment problem, not a bad request:
+        # an unset ANTHROPIC_API_KEY raises here, before any call is made.
+        # 500 would read as a bug in this service; 503 says the deployment
+        # is incomplete and retrying now will not help. The reason goes to
+        # the log rather than the response -- the caller is pointed at the
+        # health endpoint, which reports the same component without
+        # exposing configuration detail to an unauthenticated request.
+        logger.exception("Query pipeline could not be constructed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "The query pipeline is not available. "
+                "See GET /api/v1/health for component status."
+            ),
+        ) from exc
+
     request.app.state.pipeline = pipeline
     return pipeline
 
@@ -474,8 +496,10 @@ def _run_pipeline(
     response_description="A cited answer with retrieval and generation metadata.",
     responses={
         404: {"description": "No repository with that id."},
+        422: {"description": "The question could not be planned or assembled."},
         429: {"description": "The LLM provider rate limited the request."},
-        502: {"description": "The LLM provider returned an error."},
+        502: {"description": "The pipeline or the LLM provider failed."},
+        503: {"description": "A pipeline component is not configured."},
         504: {"description": "The LLM provider timed out."},
     },
 )
@@ -491,8 +515,9 @@ async def query(
     citation against the context that was actually sent to the model.
 
     Raises:
-        HTTPException: 404 if ``repo_id`` names an unknown repository, or
-            429/502/504 when the LLM provider fails.
+        HTTPException: 404 if ``repo_id`` names an unknown repository, 422
+            if the question cannot be planned, 503 if a component is not
+            configured, or 429/502/504 when the LLM provider fails.
     """
     if payload.repo_id is not None:
         repository = await session.get(Repository, payload.repo_id)
@@ -508,9 +533,31 @@ async def query(
     started = time.monotonic()
     # Every pipeline component is synchronous and the LLM call dominates the
     # request, so this must not run on the event loop.
-    prompt, generated, facts = await run_in_threadpool(
-        _run_pipeline, components, payload.question, top_k
-    )
+    try:
+        prompt, generated, facts = await run_in_threadpool(
+            _run_pipeline, components, payload.question, top_k
+        )
+    except ValueError as exc:
+        # The planner and prompt builder raise ValueError for input they
+        # cannot work with -- a question that survives field validation but
+        # still cannot be planned. That is the caller's to fix, so 422
+        # rather than the 500 an unhandled exception would produce.
+        logger.info("Query rejected by the pipeline: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+    except Exception as exc:
+        # Retrieval already degrades to empty results internally, so getting
+        # here means a component broke in a way it does not handle. 502 says
+        # the failure was downstream of this service and a retry may work,
+        # which the generic 500 handler cannot convey. The exception text
+        # stays in the log: it routinely carries file paths and provider
+        # payloads that an unauthenticated caller should not see.
+        logger.exception("Query pipeline failed for question=%r", payload.question)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="The query pipeline failed to produce an answer.",
+        ) from exc
     elapsed = time.monotonic() - started
 
     if not generated.success:

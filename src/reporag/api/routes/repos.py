@@ -15,31 +15,52 @@ caller polls ``GET /repos`` to watch ``status`` advance.
 Design
 ------
 * **Status is the contract.** A repository moves
-  ``queued -> cloning -> processing -> ready``, or lands on ``failed`` with
-  the reason recorded. That progression is the only thing a client needs to
-  understand to use this API correctly.
+  ``queued -> cloning -> processing -> ready``, or lands on ``failed``.
+  That progression is the only thing a client needs to understand to use
+  this API correctly.
+* **Every run gets a job row.** ``ingestion_jobs`` records one attempt,
+  moving ``pending -> in_progress -> completed`` or ``failed``. The
+  repository's status says what the repository is now; the job says what
+  this particular attempt did, which is what lets a re-ingest be told
+  apart from the run before it.
 * **The background task owns its own session.** The request-scoped
   ``AsyncSession`` from :func:`~reporag.db.session.get_db` is closed once
   the response is sent, so the task opens a fresh one from
   ``async_session_maker``. Reusing the request session would fail exactly
   when the work started succeeding.
 * **Failures are recorded, not raised.** Nothing is listening when a
-  background task raises. Every failure path writes ``FAILED`` and the
-  error text to the row, so the state is visible through ``GET /repos``.
+  background task raises. Every failure path marks the repository and its
+  job ``failed`` and logs the reason, so a stuck ingest is visible through
+  ``GET /repos`` rather than silently doing nothing.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Path, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Path,
+    Query,
+    status,
+)
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from reporag.db.models import Repository, RepositoryStatus, User
+from reporag.db.models import (
+    IngestionJob,
+    JobStatus,
+    Repository,
+    RepositoryStatus,
+    User,
+)
 from reporag.db.session import async_session_maker, get_db
 
 logger = logging.getLogger(__name__)
@@ -56,6 +77,11 @@ _SYSTEM_USERNAME = "system"
 # Schemes accepted for cloning. Anything else (git://, ssh://, file://) is
 # rejected at validation time rather than failing deep inside the clone.
 _ALLOWED_SCHEMES = ("https://", "http://")
+
+# Page size for GET /repos. The ceiling is a bound on response size, not a
+# policy: a client that wants everything pages through it.
+_DEFAULT_PAGE_SIZE = 50
+_MAX_PAGE_SIZE = 200
 
 
 # ---------------------------------------------------------------------------
@@ -116,14 +142,40 @@ class RepositoryResponse(BaseModel):
         name: Repository name derived from its URL.
         url: The clone URL.
         status: Current ingestion status.
+        created_at: When the repository was first queued.
+        updated_at: When its status last changed -- how a client tells a
+            run that is still working from one that stalled.
     """
 
     id: int
     name: str
     url: str
     status: RepositoryStatus
+    created_at: datetime
+    updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class RepositoryListResponse(BaseModel):
+    """Body of ``GET /api/v1/repos``.
+
+    An object rather than a bare array so the page can carry ``total``
+    alongside it: a client showing "12 of 340" cannot get that from the
+    slice it was handed.
+
+    Attributes:
+        repositories: The requested page, newest first.
+        total: Repositories that exist, not just the ones on this page.
+        limit: Page size applied, echoed back so a client can page without
+            tracking what it asked for.
+        offset: Offset this page started at.
+    """
+
+    repositories: list[RepositoryResponse]
+    total: int
+    limit: int
+    offset: int
 
 
 class IngestResponse(BaseModel):
@@ -131,11 +183,13 @@ class IngestResponse(BaseModel):
 
     Attributes:
         repository: The queued repository row.
+        job_id: The ingestion job recording this attempt.
         branch: The branch that will be ingested, echoed back.
         message: What happens next.
     """
 
     repository: RepositoryResponse
+    job_id: int
     branch: str | None = None
     message: str
 
@@ -181,13 +235,41 @@ async def _get_or_create_system_user(session: AsyncSession) -> User:
     return user
 
 
+# Repository status -> the job status that goes with it. A job is a single
+# attempt, so the three working states all map to ``in_progress``; only the
+# terminal ones differ.
+_JOB_STATUS_FOR = {
+    RepositoryStatus.QUEUED: JobStatus.PENDING,
+    RepositoryStatus.CLONING: JobStatus.IN_PROGRESS,
+    RepositoryStatus.PROCESSING: JobStatus.IN_PROGRESS,
+    RepositoryStatus.READY: JobStatus.COMPLETED,
+    RepositoryStatus.FAILED: JobStatus.FAILED,
+}
+
+
 async def _set_status(
-    repo_id: int, new_status: RepositoryStatus, *, detail: str = ""
+    repo_id: int,
+    new_status: RepositoryStatus,
+    *,
+    job_id: int | None = None,
+    detail: str = "",
 ) -> None:
-    """Update a repository's status from a background task.
+    """Advance a repository, and the job tracking this attempt, together.
 
     Opens its own session because the request-scoped one is already closed
     by the time the task runs.
+
+    Both rows move in one transaction. Committing them separately would
+    leave a window where a crash could park a repository on ``failed`` with
+    its job still reading ``in_progress``, and nothing would ever reconcile
+    the two.
+
+    Args:
+        repo_id: Repository row to advance.
+        new_status: Status to move it to.
+        job_id: Ingestion job for this attempt, moved to the matching job
+            status. ``None`` updates the repository alone.
+        detail: Context for the log line; not persisted.
     """
     async with async_session_maker() as session:
         repo = await session.get(Repository, repo_id)
@@ -195,6 +277,17 @@ async def _set_status(
             logger.warning("Repository %s vanished during ingestion", repo_id)
             return
         repo.status = new_status
+
+        if job_id is not None:
+            job = await session.get(IngestionJob, job_id)
+            if job is None:
+                # The repository outliving its job is not fatal -- status on
+                # the repository is what clients poll -- but it means the
+                # job history for this run is gone.
+                logger.warning("Ingestion job %s vanished during ingestion", job_id)
+            else:
+                job.status = _JOB_STATUS_FOR[new_status]
+
         await session.commit()
 
     if detail:
@@ -282,7 +375,9 @@ def _parse_repository(repo_url: str, branch: str | None) -> _IngestionStats:
         cloner.cleanup()
 
 
-async def run_ingestion(repo_id: int, repo_url: str, branch: str | None) -> None:
+async def run_ingestion(
+    repo_id: int, repo_url: str, branch: str | None, job_id: int | None = None
+) -> None:
     """Ingest a repository in the background, recording progress.
 
     Drives the row through ``cloning`` and ``processing`` to ``ready``, or to
@@ -294,24 +389,37 @@ async def run_ingestion(repo_id: int, repo_url: str, branch: str | None) -> None
         repo_id: Row to update as the work progresses.
         repo_url: Clone URL.
         branch: Branch to ingest, or None for the remote default.
+        job_id: Ingestion job recording this attempt, advanced in step with
+            the repository. Optional so a caller can drive a repository
+            without a job row.
     """
     try:
-        await _set_status(repo_id, RepositoryStatus.CLONING)
+        await _set_status(repo_id, RepositoryStatus.CLONING, job_id=job_id)
         stats = await run_in_threadpool(_parse_repository, repo_url, branch)
-        await _set_status(repo_id, RepositoryStatus.PROCESSING, detail=stats.summary())
+        await _set_status(
+            repo_id,
+            RepositoryStatus.PROCESSING,
+            job_id=job_id,
+            detail=stats.summary(),
+        )
 
         if stats.files == 0:
             await _set_status(
                 repo_id,
                 RepositoryStatus.FAILED,
+                job_id=job_id,
                 detail="no parseable source files found",
             )
             return
 
-        await _set_status(repo_id, RepositoryStatus.READY, detail=stats.summary())
+        await _set_status(
+            repo_id, RepositoryStatus.READY, job_id=job_id, detail=stats.summary()
+        )
     except Exception as exc:
         logger.exception("Ingestion failed for repository %s", repo_id)
-        await _set_status(repo_id, RepositoryStatus.FAILED, detail=str(exc))
+        await _set_status(
+            repo_id, RepositoryStatus.FAILED, job_id=job_id, detail=str(exc)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -346,15 +454,24 @@ async def ingest_repository(
         status=RepositoryStatus.QUEUED,
     )
     session.add(repository)
+    # Flush rather than commit so the job gets the repository's id while
+    # both rows still land in one transaction; a commit here could leave a
+    # repository with no job behind it.
+    await session.flush()
+
+    job = IngestionJob(repository_id=repository.id, status=JobStatus.PENDING)
+    session.add(job)
     await session.commit()
     await session.refresh(repository)
+    await session.refresh(job)
 
     background_tasks.add_task(
-        run_ingestion, repository.id, payload.repo_url, payload.branch
+        run_ingestion, repository.id, payload.repo_url, payload.branch, job.id
     )
 
     return IngestResponse(
         repository=RepositoryResponse.model_validate(repository),
+        job_id=job.id,
         branch=payload.branch,
         message=(
             "Ingestion queued. Poll GET /api/v1/repos/"
@@ -365,16 +482,42 @@ async def ingest_repository(
 
 @router.get(
     "",
-    response_model=list[RepositoryResponse],
+    response_model=RepositoryListResponse,
     summary="List ingested repositories",
-    response_description="Every known repository with its ingestion status.",
+    response_description="A page of repositories with their ingestion status.",
 )
 async def list_repositories(
     session: Annotated[AsyncSession, Depends(get_db)],
-) -> list[RepositoryResponse]:
-    """Return every repository with its current ingestion status."""
-    result = await session.execute(select(Repository).order_by(Repository.id))
-    return [RepositoryResponse.model_validate(repo) for repo in result.scalars().all()]
+    limit: Annotated[
+        int, Query(ge=1, le=_MAX_PAGE_SIZE, description="Page size.")
+    ] = _DEFAULT_PAGE_SIZE,
+    offset: Annotated[int, Query(ge=0, description="Rows to skip.")] = 0,
+) -> RepositoryListResponse:
+    """Return a page of repositories, newest first.
+
+    Paginated rather than returning everything: an installation that has
+    ingested a few thousand repositories should not serialise all of them
+    to answer a poll for the status of one recent ingest. ``total`` is
+    reported alongside so a client can still show how many exist.
+    """
+    total = await session.scalar(select(func.count()).select_from(Repository)) or 0
+    result = await session.execute(
+        select(Repository)
+        # Newest first, with id as the tiebreaker: rows created inside the
+        # same clock tick would otherwise order arbitrarily, and a page
+        # boundary landing mid-tie would drop or repeat a row.
+        .order_by(Repository.created_at.desc(), Repository.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    return RepositoryListResponse(
+        repositories=[
+            RepositoryResponse.model_validate(repo) for repo in result.scalars().all()
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get(
