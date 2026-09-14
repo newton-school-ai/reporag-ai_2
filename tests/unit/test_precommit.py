@@ -6,6 +6,7 @@ the ASCII guard and internal-data guard scripts work correctly.
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import yaml
@@ -16,6 +17,12 @@ ASCII_GUARD = REPO_ROOT / "scripts" / "ascii_guard.sh"
 INTERNAL_GUARD = REPO_ROOT / "scripts" / "internal_data_guard.sh"
 # Use a temp directory inside the workspace (avoids macOS sandbox issues)
 SCRATCH_DIR = REPO_ROOT / ".test_scratch"
+
+# Subprocess environment ensuring virtualenv tools are discoverable
+SUBPROCESS_ENV = {
+    **os.environ,
+    "PATH": f"{sys.prefix}/bin:{os.environ.get('PATH', '')}",
+}
 
 
 def setup_module() -> None:
@@ -85,6 +92,7 @@ class TestPreCommitConfig:
             capture_output=True,
             text=True,
             cwd=str(REPO_ROOT),
+            env=SUBPROCESS_ENV,
         )
         assert (
             result.returncode == 0
@@ -249,6 +257,7 @@ class TestRuffBlackCleanScaffold:
             capture_output=True,
             text=True,
             cwd=str(REPO_ROOT),
+            env=SUBPROCESS_ENV,
         )
         assert result.returncode == 0, f"ruff check failed:\n{result.stdout}"
 
@@ -259,5 +268,6 @@ class TestRuffBlackCleanScaffold:
             capture_output=True,
             text=True,
             cwd=str(REPO_ROOT),
+            env=SUBPROCESS_ENV,
         )
         assert result.returncode == 0, f"black --check failed:\n{result.stderr}"
