@@ -58,11 +58,41 @@ class RepositoryStatus(enum.StrEnum):
 
 
 class User(BaseTimestampModel):
+    """An account, created locally or through Google OAuth (Issue 27).
+
+    Identity is keyed on ``google_id`` rather than ``email`` for federated
+    accounts: Google's ``sub`` claim is the only stable identifier it
+    promises. A Workspace user who changes their primary address keeps the
+    same ``sub``, so matching on email would silently create a second
+    account and orphan their repositories.
+    """
+
     __tablename__ = "users"
 
     username: Mapped[str] = mapped_column(String(50), unique=True, index=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
-    hashed_password: Mapped[str] = mapped_column(String(255))
+    # Nullable: an account created through OAuth has no password to hash,
+    # and storing a placeholder would make "has no password" indistinguishable
+    # from "password is the literal placeholder" at the point a local login
+    # flow checks it.
+    hashed_password: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # --- Federated identity (Google OAuth) ---
+    # Google's `sub` claim. Unique but nullable, so locally created accounts
+    # coexist with federated ones.
+    google_id: Mapped[str | None] = mapped_column(
+        String(255), unique=True, index=True, nullable=True
+    )
+    full_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    avatar_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    last_login_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    @property
+    def is_federated(self) -> bool:
+        """True when this account signs in through an external provider."""
+        return self.google_id is not None
 
     # Relationships
     repositories: Mapped[list["Repository"]] = relationship(

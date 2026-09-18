@@ -23,6 +23,7 @@ from pydantic import SecretStr
 from reporag.api.routes import health as health_routes
 from reporag.api.routes.health import (
     API_VERSION,
+    _check_google_oauth,
     _check_llm,
     _check_neo4j,
     _check_qdrant,
@@ -36,16 +37,23 @@ def _stub_probes(
     neo4j: str = "ok",
     qdrant: str = "ok",
     llm: str = "ok",
+    google_oauth: str = "ok",
 ) -> None:
-    """Replace the three out-of-process probes with fixed verdicts.
+    """Replace the configuration and out-of-process probes with verdicts.
 
     The database probe is left real: it runs against the temporary SQLite
     file the fixtures already provide, so there is nothing to fake.
     """
-    for name, verdict in (("neo4j", neo4j), ("qdrant", qdrant), ("llm", llm)):
+    verdicts = {
+        "_check_neo4j": neo4j,
+        "_check_qdrant": qdrant,
+        "_check_llm": llm,
+        "_check_google_oauth": google_oauth,
+    }
+    for probe, verdict in verdicts.items():
         monkeypatch.setattr(
             health_routes,
-            f"_check_{name}",
+            probe,
             lambda verdict=verdict: health_routes.ComponentHealth(
                 status=verdict, detail=""
             ),
@@ -81,7 +89,13 @@ class TestComponentHealth:
     ) -> None:
         _stub_probes(monkeypatch)
         body = client.get("/api/v1/health").json()
-        assert set(body["components"]) == {"database", "neo4j", "qdrant", "llm"}
+        assert set(body["components"]) == {
+            "database",
+            "neo4j",
+            "qdrant",
+            "llm",
+            "google_oauth",
+        }
 
     def test_reports_version_and_environment(
         self, client: Any, monkeypatch: pytest.MonkeyPatch
@@ -97,7 +111,7 @@ class TestComponentHealth:
         _stub_probes(monkeypatch)
         assert client.get("/api/v1/health").json()["status"] == "ok"
 
-    @pytest.mark.parametrize("failing", ["neo4j", "qdrant", "llm"])
+    @pytest.mark.parametrize("failing", ["neo4j", "qdrant", "llm", "google_oauth"])
     def test_one_bad_component_degrades_the_whole(
         self, client: Any, monkeypatch: pytest.MonkeyPatch, failing: str
     ) -> None:
@@ -173,6 +187,53 @@ class TestQdrantProbe:
         result = _check_qdrant()
         assert result.status == "error"
         assert "unreachable" in result.detail
+
+
+class TestGoogleOAuthProbe:
+    """Reports whether Google sign-in (Issue 27) can work at all."""
+
+    def test_unset_client_id_is_not_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(live_settings, "google_client_id", "")
+        result = _check_google_oauth()
+        assert result.status == "not_configured"
+        assert "GOOGLE_CLIENT_ID" in result.detail
+
+    def test_placeholder_secret_is_not_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(live_settings, "google_client_id", "id.apps.google.com")
+        monkeypatch.setattr(
+            live_settings,
+            "google_client_secret",
+            SecretStr("your-google-client-secret"),
+        )
+        # The value shipped in .env.example. Reporting it healthy would mean
+        # the first person trying to sign in discovers the problem.
+        assert _check_google_oauth().status == "not_configured"
+
+    def test_configured_credentials_report_ok(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(live_settings, "google_client_id", "id.apps.google.com")
+        monkeypatch.setattr(
+            live_settings, "google_client_secret", SecretStr("real-secret")
+        )
+        result = _check_google_oauth()
+        assert result.status == "ok"
+        # The redirect URI is the setting that most often disagrees with the
+        # Google console, so the probe names it.
+        assert live_settings.google_redirect_uri in result.detail
+
+    def test_the_secret_is_never_reported(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(live_settings, "google_client_id", "id.apps.google.com")
+        monkeypatch.setattr(
+            live_settings, "google_client_secret", SecretStr("super-secret-value")
+        )
+        assert "super-secret-value" not in _check_google_oauth().detail
 
 
 class TestLlmProbe:

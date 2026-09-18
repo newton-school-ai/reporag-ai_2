@@ -272,22 +272,22 @@ def _stub_probes(
     neo4j: str = "ok",
     qdrant: str = "ok",
     llm: str = "ok",
+    google_oauth: str = "ok",
 ) -> None:
     """Force each external probe to a chosen status without any I/O."""
     from reporag.api.routes.health import ComponentHealth
 
-    monkeypatch.setattr(
-        "reporag.api.routes.health._check_neo4j",
-        lambda: ComponentHealth(status=neo4j, detail="stub"),
-    )
-    monkeypatch.setattr(
-        "reporag.api.routes.health._check_qdrant",
-        lambda: ComponentHealth(status=qdrant, detail="stub"),
-    )
-    monkeypatch.setattr(
-        "reporag.api.routes.health._check_llm",
-        lambda: ComponentHealth(status=llm, detail="stub"),
-    )
+    verdicts = {
+        "_check_neo4j": neo4j,
+        "_check_qdrant": qdrant,
+        "_check_llm": llm,
+        "_check_google_oauth": google_oauth,
+    }
+    for probe, verdict in verdicts.items():
+        monkeypatch.setattr(
+            f"reporag.api.routes.health.{probe}",
+            lambda verdict=verdict: ComponentHealth(status=verdict, detail="stub"),
+        )
 
 
 class TestComponentHealth:
@@ -296,7 +296,13 @@ class TestComponentHealth:
     ) -> None:
         _stub_probes(monkeypatch)
         body = client.get("/api/v1/health").json()
-        assert set(body["components"]) == {"database", "neo4j", "qdrant", "llm"}
+        assert set(body["components"]) == {
+            "database",
+            "neo4j",
+            "qdrant",
+            "llm",
+            "google_oauth",
+        }
 
     def test_all_healthy_reports_ok(
         self, client: Any, monkeypatch: pytest.MonkeyPatch
