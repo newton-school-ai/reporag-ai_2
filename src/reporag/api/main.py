@@ -42,6 +42,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from reporag.api.routes import auth as auth_routes
 from reporag.api.routes import health as health_routes
 from reporag.api.routes import query as query_routes
 from reporag.api.routes import repos as repos_routes
@@ -63,6 +64,7 @@ DESCRIPTION = """
 Code-aware repository intelligence: ask questions about a codebase and get
 answers cited to the exact file and line range.
 
+* `GET /auth/google` starts Google sign-in.
 * `POST /api/v1/repos/ingest` queues a repository for ingestion.
 * `GET /api/v1/repos` reports ingestion status.
 * `POST /api/v1/query` answers a question with citations.
@@ -166,6 +168,10 @@ def create_app() -> FastAPI:
     app.include_router(health_routes.router, prefix=API_V1_PREFIX)
     app.include_router(repos_routes.router, prefix=API_V1_PREFIX)
     app.include_router(query_routes.router, prefix=API_V1_PREFIX)
+    # Unversioned: the redirect URI is registered in the Google Cloud
+    # console and changing it later means editing external configuration,
+    # so it stays outside the path that exists in order to be versioned.
+    app.include_router(auth_routes.router)
 
     _register_exception_handlers(app)
 
