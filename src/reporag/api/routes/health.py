@@ -180,6 +180,25 @@ def _check_llm() -> ComponentHealth:
     )
 
 
+def _check_google_oauth() -> ComponentHealth:
+    """Report Google OAuth readiness from configuration.
+
+    Verifying credentials for real would mean a round trip to Google on every
+    poll. The failure this catches is a deployment where /auth/google returns 503.
+    """
+    from reporag.config import _is_unset
+
+    if _is_unset(settings.google_client_secret) or not settings.google_client_id:
+        return ComponentHealth(
+            status="not_configured",
+            detail="GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET is unset",
+        )
+
+    return ComponentHealth(
+        status="ok", detail=f"configured (redirect_uri: {settings.google_redirect_uri})"
+    )
+
+
 @router.get(
     "/health",
     response_model=HealthResponse,
@@ -208,6 +227,7 @@ async def health(
         "neo4j": neo4j_health,
         "qdrant": qdrant_health,
         "llm": _check_llm(),
+        "google_oauth": _check_google_oauth(),
     }
 
     overall: Any = (

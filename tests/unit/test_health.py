@@ -36,13 +36,15 @@ def _stub_probes(
     neo4j: str = "ok",
     qdrant: str = "ok",
     llm: str = "ok",
+    google_oauth: str = "ok",
 ) -> None:
-    """Replace the three out-of-process probes with fixed verdicts.
-
-    The database probe is left real: it runs against the temporary SQLite
-    file the fixtures already provide, so there is nothing to fake.
-    """
-    for name, verdict in (("neo4j", neo4j), ("qdrant", qdrant), ("llm", llm)):
+    """Replace the out-of-process probes with fixed verdicts."""
+    for name, verdict in (
+        ("neo4j", neo4j),
+        ("qdrant", qdrant),
+        ("llm", llm),
+        ("google_oauth", google_oauth),
+    ):
         monkeypatch.setattr(
             health_routes,
             f"_check_{name}",
@@ -81,7 +83,13 @@ class TestComponentHealth:
     ) -> None:
         _stub_probes(monkeypatch)
         body = client.get("/api/v1/health").json()
-        assert set(body["components"]) == {"database", "neo4j", "qdrant", "llm"}
+        assert set(body["components"]) == {
+            "database",
+            "neo4j",
+            "qdrant",
+            "llm",
+            "google_oauth",
+        }
 
     def test_reports_version_and_environment(
         self, client: Any, monkeypatch: pytest.MonkeyPatch
