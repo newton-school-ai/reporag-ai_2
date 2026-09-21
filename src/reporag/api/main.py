@@ -42,6 +42,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from reporag.api.routes import auth as auth_routes
 from reporag.api.routes import health as health_routes
 from reporag.api.routes import query as query_routes
 from reporag.api.routes import repos as repos_routes
@@ -163,6 +164,9 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # Auth lives at /auth/*, unversioned, because Google redirects the
+    # browser to a fixed callback URL.
+    app.include_router(auth_routes.router)
     app.include_router(health_routes.router, prefix=API_V1_PREFIX)
     app.include_router(repos_routes.router, prefix=API_V1_PREFIX)
     app.include_router(query_routes.router, prefix=API_V1_PREFIX)
