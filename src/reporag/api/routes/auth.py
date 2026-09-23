@@ -1,8 +1,8 @@
 """Google OAuth 2.0 authentication endpoints.
 
-GET /auth/google          - Redirect to Google OAuth consent screen.
-GET /auth/google/callback - Exchange authorization code for tokens, upsert user,
-                            and return JWT access + refresh tokens.
+GET /auth/google          - Redirect to Google OAuth consent screen with CSRF state.
+GET /auth/google/callback - Exchange authorization code for tokens, validate state,
+                            upsert user, and return JWT access + refresh tokens.
 """
 
 from __future__ import annotations
@@ -14,13 +14,21 @@ from typing import Annotated
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from reporag.api.middleware.auth import create_access_token, create_refresh_token
+from reporag.api.middleware.auth import (
+    AuthError,
+    InvalidTokenError,
+    TokenExpiredError,
+    create_access_token,
+    create_refresh_token,
+    create_state_token,
+    validate_state_token,
+)
 from reporag.config import settings
 from reporag.db.models import User
 from reporag.db.session import get_db
@@ -107,7 +115,7 @@ async def login_google() -> RedirectResponse:
     """Redirect to Google OAuth 2.0 consent screen.
 
     Builds the authorization URL with required scopes (openid, email, profile)
-    and a generated CSRF state parameter.
+    and a generated CSRF state parameter. Also sets a secure HTTP-only cookie.
     """
     if not settings.google_client_id or settings.google_client_id.strip() in (
         "",
@@ -118,7 +126,7 @@ async def login_google() -> RedirectResponse:
             detail="Google OAuth is not configured on this server.",
         )
 
-    state = secrets.token_urlsafe(32)
+    state = create_state_token()
     params = {
         "client_id": settings.google_client_id,
         "redirect_uri": settings.google_redirect_uri,
@@ -129,12 +137,22 @@ async def login_google() -> RedirectResponse:
         "prompt": "consent",
     }
     redirect_url = f"{GOOGLE_AUTH_URL}?{urlencode(params)}"
-    return RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
+    response = RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
+    response.set_cookie(
+        key="oauth_state",
+        value=state,
+        httponly=True,
+        max_age=600,
+        samesite="lax",
+    )
+    return response
 
 
 @router.get("/google/callback", response_model=TokenResponse)
 async def google_callback(
     session: Annotated[AsyncSession, Depends(get_db)],
+    request: Request,
+    response: Response,
     code: str | None = Query(default=None),
     state: str | None = Query(default=None),
     error: str | None = Query(default=None),
@@ -143,11 +161,13 @@ async def google_callback(
     """Exchange authorization code for tokens, fetch user info, and issue JWTs.
 
     Args:
+        session: Database session dependency.
+        request: FastAPI HTTP request to access cookies and client state.
+        response: FastAPI HTTP response to clear cookies.
         code: Authorization code returned by Google.
         state: CSRF state parameter.
         error: OAuth error code (if user denied consent or error occurred).
         error_description: Human-readable error description from Google.
-        session: Database session dependency.
 
     Returns:
         TokenResponse containing JWT access and refresh tokens along with user info.
@@ -160,13 +180,42 @@ async def google_callback(
             detail=f"Google OAuth error: {detail}",
         )
 
+    # 1. Validate state parameter to protect against CSRF and login hijacking
+    if not state:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing OAuth state parameter",
+        )
+
+    try:
+        validate_state_token(state)
+    except TokenExpiredError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OAuth state parameter has expired",
+        ) from exc
+    except (InvalidTokenError, AuthError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid OAuth state parameter: {exc}",
+        ) from exc
+
+    cookie_state = request.cookies.get("oauth_state")
+    if cookie_state and not secrets.compare_digest(cookie_state, state):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OAuth state does not match session state",
+        )
+    if "oauth_state" in request.cookies:
+        response.delete_cookie(key="oauth_state")
+
     if not code:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Missing authorization code",
         )
 
-    # 1. Exchange authorization code for Google access token
+    # 2. Exchange authorization code for Google access token
     token_data = {
         "client_id": settings.google_client_id,
         "client_secret": settings.google_client_secret.get_secret_value(),
@@ -197,7 +246,7 @@ async def google_callback(
                     detail="No access token returned from Google",
                 )
 
-            # 2. Fetch user profile from Google userinfo endpoint
+            # 3. Fetch user profile from Google userinfo endpoint
             headers = {"Authorization": f"Bearer {google_access_token}"}
             userinfo_response = await client.get(GOOGLE_USERINFO_URL, headers=headers)
             if userinfo_response.status_code != status.HTTP_200_OK:
@@ -220,7 +269,7 @@ async def google_callback(
         ) from exc
 
     email = userinfo.get("email")
-    email_verified = userinfo.get("email_verified", True)
+    email_verified = userinfo.get("email_verified")
 
     if not email:
         raise HTTPException(
@@ -228,7 +277,8 @@ async def google_callback(
             detail="Google account did not provide an email address",
         )
 
-    if not email_verified:
+    # Reject logins where email_verified isn't explicitly True
+    if email_verified is not True:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Google account email is not verified",
@@ -236,10 +286,10 @@ async def google_callback(
 
     name = userinfo.get("name")
 
-    # 3. Create or update user in database
+    # 4. Create or update user in database
     user = await _upsert_user(session, email=email, name=name)
 
-    # 4. Issue JWT access and refresh tokens
+    # 5. Issue JWT access and refresh tokens
     access_token = create_access_token(user_id=user.id, email=user.email)
     refresh_token = create_refresh_token(user_id=user.id, email=user.email)
 

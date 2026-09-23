@@ -168,7 +168,6 @@ def create_app() -> FastAPI:
     app.include_router(repos_routes.router, prefix=API_V1_PREFIX)
     app.include_router(query_routes.router, prefix=API_V1_PREFIX)
     app.include_router(auth_routes.router)
-    app.include_router(auth_routes.router, prefix=API_V1_PREFIX)
 
     _register_exception_handlers(app)
 
