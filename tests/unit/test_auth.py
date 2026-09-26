@@ -195,17 +195,29 @@ class TestGoogleOAuthRoutes:
         assert "does not match session state" in response.json()["detail"]
         client.cookies.clear()
 
+    def test_callback_missing_cookie(self, client: TestClient) -> None:
+        state = create_state_token()
+        response = client.get(
+            "/auth/google/callback",
+            params={"code": "some_code", "state": state},
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert "Missing OAuth state cookie" in response.json()["detail"]
+
     def test_callback_missing_code(self, client: TestClient) -> None:
         state = create_state_token()
+        client.cookies.set("oauth_state", state)
         response = client.get("/auth/google/callback", params={"state": state})
         assert response.status_code == status.HTTP_400_BAD_REQUEST
         assert "Missing authorization code" in response.json()["detail"]
+        client.cookies.clear()
 
     def test_callback_token_exchange_network_error(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(settings, "google_client_id", "test-client-id")
         state = create_state_token()
+        client.cookies.set("oauth_state", state)
 
         async def mock_post(*args: Any, **kwargs: Any) -> httpx.Response:
             raise httpx.ConnectError("Connection refused")
@@ -223,6 +235,7 @@ class TestGoogleOAuthRoutes:
     ) -> None:
         monkeypatch.setattr(settings, "google_client_id", "test-client-id")
         state = create_state_token()
+        client.cookies.set("oauth_state", state)
 
         mock_resp = httpx.Response(
             status_code=400,
@@ -243,6 +256,7 @@ class TestGoogleOAuthRoutes:
     ) -> None:
         monkeypatch.setattr(settings, "google_client_id", "test-client-id")
         state = create_state_token()
+        client.cookies.set("oauth_state", state)
 
         token_resp = httpx.Response(
             status_code=200,
@@ -273,6 +287,7 @@ class TestGoogleOAuthRoutes:
     ) -> None:
         monkeypatch.setattr(settings, "google_client_id", "test-client-id")
         state = create_state_token()
+        client.cookies.set("oauth_state", state)
 
         token_resp = httpx.Response(
             status_code=200,
@@ -304,6 +319,7 @@ class TestGoogleOAuthRoutes:
         """Reject Google logins where email_verified is omitted and not explicitly True."""
         monkeypatch.setattr(settings, "google_client_id", "test-client-id")
         state = create_state_token()
+        client.cookies.set("oauth_state", state)
 
         token_resp = httpx.Response(
             status_code=200,
@@ -394,6 +410,7 @@ class TestGoogleOAuthRoutes:
     ) -> None:
         monkeypatch.setattr(settings, "google_client_id", "test-client-id")
         state = create_state_token()
+        client.cookies.set("oauth_state", state)
 
         # Seed existing user
         user = User(

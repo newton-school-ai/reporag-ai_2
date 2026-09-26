@@ -201,13 +201,17 @@ async def google_callback(
         ) from exc
 
     cookie_state = request.cookies.get("oauth_state")
-    if cookie_state and not secrets.compare_digest(cookie_state, state):
+    if not cookie_state:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing OAuth state cookie",
+        )
+    if not secrets.compare_digest(cookie_state, state):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="OAuth state does not match session state",
         )
-    if "oauth_state" in request.cookies:
-        response.delete_cookie(key="oauth_state")
+    response.delete_cookie(key="oauth_state")
 
     if not code:
         raise HTTPException(
