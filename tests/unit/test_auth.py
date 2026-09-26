@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
+import pytest_asyncio
 from fastapi import FastAPI, status
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -455,3 +456,149 @@ class TestGoogleOAuthRoutes:
         assert data["user"]["id"] == existing_id
         assert data["user"]["email"] == "existing@example.com"
         assert data["user"]["username"] == "existing_dev"
+
+
+# ===========================================================================
+# 3. get_current_user / protected route tests (Issue 28)
+# ===========================================================================
+
+
+class TestGetCurrentUserAndProtectedRoutes:
+    """Tests for the ``get_current_user`` dependency via ``GET /auth/me``."""
+
+    @pytest_asyncio.fixture
+    async def seeded_user(self, db_session: AsyncSession) -> User:
+        user = User(
+            username="protected_dev",
+            email="protected@example.com",
+            hashed_password="oauth:google",
+        )
+        db_session.add(user)
+        await db_session.commit()
+        await db_session.refresh(user)
+        return user
+
+    def test_me_without_token_returns_401(self, client: TestClient) -> None:
+        response = client.get("/auth/me")
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+        assert response.headers["www-authenticate"] == "Bearer"
+
+    def test_me_with_malformed_header_returns_401(self, client: TestClient) -> None:
+        response = client.get(
+            "/auth/me", headers={"Authorization": "NotBearer sometoken"}
+        )
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    def test_me_with_tampered_token_returns_401(self, client: TestClient) -> None:
+        token = create_access_token(user_id=1, email="x@example.com")
+        response = client.get(
+            "/auth/me", headers={"Authorization": f"Bearer {token[:-4]}xxxx"}
+        )
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+        assert "Invalid authentication token" in response.json()["detail"]
+
+    def test_me_with_expired_token_returns_401(self, client: TestClient) -> None:
+        token = create_access_token(
+            user_id=1, email="x@example.com", expires_delta=timedelta(seconds=-10)
+        )
+        response = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+        assert "expired" in response.json()["detail"]
+
+    def test_me_with_refresh_token_returns_401(self, client: TestClient) -> None:
+        """A refresh token presented as a bearer credential is rejected."""
+        token = create_refresh_token(user_id=1, email="x@example.com")
+        response = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+        assert "not an access token" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_me_with_valid_token_for_deleted_user_returns_401(
+        self, client: TestClient
+    ) -> None:
+        token = create_access_token(user_id=999_999, email="ghost@example.com")
+        response = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+        assert "no longer exists" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_me_with_valid_token_returns_current_user(
+        self, client: TestClient, seeded_user: User
+    ) -> None:
+        token = create_access_token(user_id=seeded_user.id, email=seeded_user.email)
+        response = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["id"] == seeded_user.id
+        assert data["email"] == "protected@example.com"
+        assert data["username"] == "protected_dev"
+
+
+# ===========================================================================
+# 4. POST /auth/refresh tests (Issue 28)
+# ===========================================================================
+
+
+class TestRefreshEndpoint:
+    """Tests for exchanging a refresh token via ``POST /auth/refresh``."""
+
+    @pytest_asyncio.fixture
+    async def seeded_user(self, db_session: AsyncSession) -> User:
+        user = User(
+            username="refresh_dev",
+            email="refresh_route@example.com",
+            hashed_password="oauth:google",
+        )
+        db_session.add(user)
+        await db_session.commit()
+        await db_session.refresh(user)
+        return user
+
+    @pytest.mark.asyncio
+    async def test_refresh_with_valid_token_issues_new_pair(
+        self, client: TestClient, seeded_user: User
+    ) -> None:
+        old_refresh = create_refresh_token(
+            user_id=seeded_user.id, email=seeded_user.email
+        )
+        response = client.post("/auth/refresh", json={"refresh_token": old_refresh})
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["token_type"] == "bearer"
+        assert data["user"]["email"] == "refresh_route@example.com"
+
+        new_access_payload = decode_token(data["access_token"])
+        assert new_access_payload["type"] == "access"
+        assert new_access_payload["sub"] == str(seeded_user.id)
+
+        new_refresh_payload = decode_token(data["refresh_token"])
+        assert new_refresh_payload["type"] == "refresh"
+        assert new_refresh_payload["sub"] == str(seeded_user.id)
+
+    def test_refresh_with_access_token_rejected(self, client: TestClient) -> None:
+        """An access token presented at /refresh is rejected -- wrong token type."""
+        access_token = create_access_token(user_id=1, email="x@example.com")
+        response = client.post("/auth/refresh", json={"refresh_token": access_token})
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+        assert "not a refresh token" in response.json()["detail"]
+
+    def test_refresh_with_expired_token_returns_401(self, client: TestClient) -> None:
+        expired = create_refresh_token(
+            user_id=1, email="x@example.com", expires_delta=timedelta(seconds=-10)
+        )
+        response = client.post("/auth/refresh", json={"refresh_token": expired})
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+        assert "expired" in response.json()["detail"]
+
+    def test_refresh_with_malformed_token_returns_401(self, client: TestClient) -> None:
+        response = client.post(
+            "/auth/refresh", json={"refresh_token": "not-a-real-token"}
+        )
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+        assert "Invalid refresh token" in response.json()["detail"]
+
+    def test_refresh_for_deleted_user_returns_401(self, client: TestClient) -> None:
+        token = create_refresh_token(user_id=999_999, email="ghost@example.com")
+        response = client.post("/auth/refresh", json={"refresh_token": token})
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+        assert "no longer exists" in response.json()["detail"]

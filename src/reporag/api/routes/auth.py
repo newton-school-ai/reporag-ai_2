@@ -1,8 +1,12 @@
-"""Google OAuth 2.0 authentication endpoints.
+"""Google OAuth 2.0 authentication endpoints, plus JWT session management.
 
-GET /auth/google          - Redirect to Google OAuth consent screen with CSRF state.
-GET /auth/google/callback - Exchange authorization code for tokens, validate state,
-                            upsert user, and return JWT access + refresh tokens.
+GET  /auth/google          - Redirect to Google OAuth consent screen with CSRF state.
+GET  /auth/google/callback - Exchange authorization code for tokens, validate state,
+                             upsert user, and return JWT access + refresh tokens.
+POST /auth/refresh         - Exchange a refresh token for a new access/refresh pair.
+GET  /auth/me              - Return the caller's profile; protected by
+                             ``get_current_user`` (Issue 28), demonstrating the
+                             dependency on a real route.
 """
 
 from __future__ import annotations
@@ -27,6 +31,8 @@ from reporag.api.middleware.auth import (
     create_access_token,
     create_refresh_token,
     create_state_token,
+    decode_token,
+    get_current_user,
     validate_state_token,
 )
 from reporag.config import settings
@@ -64,6 +70,12 @@ class TokenResponse(BaseModel):
     refresh_token: str
     token_type: str = "bearer"
     user: UserProfileResponse
+
+
+class RefreshRequest(BaseModel):
+    """Request body for exchanging a refresh token."""
+
+    refresh_token: str
 
 
 # ---------------------------------------------------------------------------
@@ -306,4 +318,99 @@ async def google_callback(
             email=user.email,
             username=user.username,
         ),
+    )
+
+
+@router.post("/refresh", response_model=TokenResponse)
+async def refresh_access_token(
+    body: RefreshRequest,
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> TokenResponse:
+    """Exchange a valid refresh token for a new access/refresh token pair.
+
+    The refresh token is re-verified against the database (not just its
+    signature) so a user deleted after the token was issued can't keep
+    minting fresh access tokens forever. Both tokens are rotated -- the old
+    refresh token isn't re-issued -- which caps how long a leaked refresh
+    token stays useful to whoever leaked it, at the cost of the caller
+    needing to persist the new one.
+
+    Args:
+        body: The refresh token to exchange.
+        session: Database session dependency.
+
+    Returns:
+        A new ``TokenResponse`` with fresh access and refresh tokens.
+
+    Raises:
+        HTTPException: 401 if the token is missing, invalid, expired, not a
+            refresh token, or no longer refers to an existing user.
+    """
+    try:
+        payload = decode_token(body.refresh_token)
+    except TokenExpiredError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token has expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+    except (InvalidTokenError, AuthError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid refresh token: {exc}",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+    if payload.get("type") != "refresh":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token is not a refresh token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        user_id = int(payload["sub"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid refresh token",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+    user = await session.get(User, user_id)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User no longer exists",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    new_access_token = create_access_token(user_id=user.id, email=user.email)
+    new_refresh_token = create_refresh_token(user_id=user.id, email=user.email)
+
+    return TokenResponse(
+        access_token=new_access_token,
+        refresh_token=new_refresh_token,
+        token_type="bearer",
+        user=UserProfileResponse(
+            id=user.id,
+            email=user.email,
+            username=user.username,
+        ),
+    )
+
+
+@router.get("/me", response_model=UserProfileResponse)
+async def read_current_user(
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> UserProfileResponse:
+    """Return the authenticated caller's profile.
+
+    Protected by ``get_current_user``: requests without a valid bearer
+    access token never reach this body, short-circuiting with 401 instead.
+    """
+    return UserProfileResponse(
+        id=current_user.id,
+        email=current_user.email,
+        username=current_user.username,
     )
